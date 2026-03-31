@@ -30,5 +30,12 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        Commands::Compdb { manifest } => {
+            println!("{}", "🦀 Crub-graper: Generating compile_commands.json...".bright_green());
+            if let Err(e) = core::builder::export_compdb(manifest).await {
+                eprintln!("{} {}", "❌ Generation failed:".red().bold(), e);
+                std::process::exit(1);
+            }
+        }
     }
 }

@@ -27,4 +27,9 @@ pub enum Commands {
         #[arg(short, long)]
         target: Option<String>,
     },
+    /// Generate compile_commands.json for VS Code / clangd
+    Compdb {
+        #[arg(short, long, default_value = "Crub.toml")]
+        manifest: String,
+    },
 }

@@ -1,15 +1,16 @@
 use super::scanner::{discover_sources, TranslationUnit};
-use crate::config::{load_manifest};
+use crate::config::{load_manifest, Package};
 use colored::*;
 use futures::future::join_all;
 use petgraph::algo::toposort;
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::Reversed;
 use petgraph::Direction;
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Command;
@@ -23,6 +24,14 @@ struct BuildContext {
     include_dirs: Vec<String>,
     obj_dir: PathBuf,
     pb: ProgressBar, // Progress bar for thread-safe console output
+}
+
+#[derive(Serialize)]
+struct CompileCommand {
+    directory: String,
+    arguments: Vec<String>,
+    file: String,
+    output: String,
 }
 
 pub async fn build_project(manifest_path: &str, _target_name: Option<&str>) -> Result<(), String> {
@@ -76,6 +85,10 @@ pub async fn build_project(manifest_path: &str, _target_name: Option<&str>) -> R
         deep_hashes.insert(node_idx, hex::encode(hasher.finalize()));
     }
 
+    if let Err(e) = write_compdb(pkg, &units, &deep_hashes, &node_indices, &obj_dir) {
+        println!("{}", format!("⚠️ Warning: Failed to generate compile_commands.json: {}", e).yellow());
+    }
+
     let pb = ProgressBar::new_spinner();
     pb.enable_steady_tick(Duration::from_millis(150));
     pb.set_style(
@@ -111,7 +124,7 @@ pub async fn build_project(manifest_path: &str, _target_name: Option<&str>) -> R
         pb: pb.clone(), 
     });
 
-    pb.println(format!("{}", "🚀 Starting parallel build...".bright_cyan().bold()));
+    pb.println(format!("{}", "Starting to build...".bright_cyan().bold()));
 
     let mut in_degrees: HashMap<NodeIndex, usize> = HashMap::new();
     for node in graph.node_indices() {
@@ -236,9 +249,134 @@ pub async fn build_project(manifest_path: &str, _target_name: Option<&str>) -> R
         }
     }
 
-    // Clean up animation before final print
     pb.finish_and_clear();
     println!("{:>12} project!", "Finished".bright_green().bold());
+    Ok(())
+}
+
+pub async fn export_compdb(manifest_path: &str) -> Result<(), String> {
+    let manifest = load_manifest(manifest_path)?;
+    let pkg = &manifest.package;
+
+    let build_dir = PathBuf::from(&pkg.out_dir);
+    let obj_dir = build_dir.join("obj");
+
+    let units = discover_sources(&pkg.source_dir, pkg);
+    if units.is_empty() {
+        return Err("No C++ source files found in the source directory.".to_string());
+    }
+
+    let mut graph = DiGraph::<usize, ()>::new();
+    let mut module_to_node = HashMap::new();
+    let mut node_indices = Vec::new();
+
+    for (i, unit) in units.iter().enumerate() {
+        let idx = graph.add_node(i);
+        node_indices.push(idx);
+        if let Some(mod_name) = &unit.exported_module {
+            module_to_node.insert(mod_name.clone(), idx);
+        }
+    }
+
+    for (i, unit) in units.iter().enumerate() {
+        for imp in &unit.imports {
+            if let Some(&target_idx) = module_to_node.get(imp) {
+                graph.add_edge(target_idx, node_indices[i], ());
+            }
+        }
+    }
+
+    let order = toposort(&graph, None).map_err(|_| {"🔄 Cyclic dependency detected in your C++ modules!"})?;
+
+    let mut deep_hashes: HashMap<NodeIndex, String> = HashMap::new();
+    for &node_idx in &order {
+        let unit_idx = graph[node_idx];
+        let mut hasher = Sha256::new();
+        hasher.update(&units[unit_idx].base_hash);
+
+        for neighbor in graph.neighbors_directed(node_idx, Direction::Incoming) {
+            if let Some(dep_hash) = deep_hashes.get(&neighbor) {
+                hasher.update(dep_hash);
+            }
+        }
+        deep_hashes.insert(node_idx, hex::encode(hasher.finalize()));
+    }
+
+    write_compdb(pkg, &units, &deep_hashes, &node_indices, &obj_dir)?;
+    
+    println!("{}", "compile_commands.json generated successfully!".bright_green());
+    Ok(())
+}
+
+fn write_compdb(
+    pkg: &Package,
+    units: &[TranslationUnit],
+    deep_hashes: &HashMap<NodeIndex, String>,
+    node_indices: &[NodeIndex],
+    obj_dir: &Path,
+) -> Result<(), String> {
+    let current_dir_path = std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."));
+    let current_dir_str = current_dir_path.to_string_lossy().to_string();
+
+    let mut commands = Vec::new();
+
+    for (i, unit) in units.iter().enumerate() {
+        let node_idx = node_indices[i];
+        let deep_hash = &deep_hashes[&node_idx];
+        
+        let safe_name = unit.path.file_stem().unwrap().to_str().unwrap().replace('.', "_");
+        let hash_prefix = &deep_hash[0..8];
+        let obj_name = format!("{}_{}.o", safe_name, hash_prefix);
+        
+        let abs_file = fs::canonicalize(&unit.path)
+            .unwrap_or_else(|_| current_dir_path.join(&unit.path));
+        let abs_file_str = abs_file.to_string_lossy().to_string();
+
+        let abs_output = current_dir_path.join(obj_dir).join(&obj_name);
+        let abs_output_str = abs_output.to_string_lossy().to_string();
+
+        let mut args = vec![
+            pkg.compiler.clone(),
+            pkg.standard.clone(),
+            "-c".to_string(),
+        ];
+        
+        args.extend(pkg.flags.clone());
+        
+        for inc in &pkg.include_dirs {
+            let abs_inc = current_dir_path.join(inc);
+            args.push(format!("-I{}", abs_inc.to_string_lossy()));
+        }
+
+        if pkg.compiler.contains("clang") {
+            args.push("-fprebuilt-module-path=.".to_string());
+            if unit.exported_module.is_some() || unit.path.extension().unwrap_or_default() == "cppm" {
+                args.push("-Xclang".to_string());
+                args.push("-emit-module-interface".to_string());
+            }
+        } else {
+            args.push("-fmodules-ts".to_string());
+        }
+
+        args.push(abs_file_str.clone());
+        args.push("-o".to_string());
+        args.push(abs_output_str.clone());
+
+        commands.push(CompileCommand {
+            directory: current_dir_str.clone(),
+            arguments: args,
+            file: abs_file_str,
+            output: abs_output_str, 
+        });
+    }
+
+    let json = serde_json::to_string_pretty(&commands)
+        .map_err(|e| format!("Failed to serialize compile_commands.json: {}", e))?;
+    
+    fs::write(current_dir_path.join("compile_commands.json"), json)
+        .map_err(|e| format!("Failed to write compile_commands.json: {}", e))?;
+
     Ok(())
 }
 
@@ -261,7 +399,6 @@ async fn compile_unit(
     };
 
     if is_cached {
-        // USE pb.println() to not overwrite the animation!
         ctx.pb.println(format!("{:>12} {}", "Cached".bright_blue().bold(), unit.path.display()));
         return Ok(obj_path);
     }
