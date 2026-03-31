@@ -43,3 +43,18 @@ pub fn load_manifest<P: AsRef<Path>>(path: P) -> Result<Manifest, String> {
     toml::from_str(&content)
         .map_err(|e| format!("Failed to parse Crub.toml: {}", e))
 }
+
+pub const DEFAULT: &str = r#"[package]
+compiler = "clang++"
+standard = "-std=c++26"
+source_dir = "./src" 
+out_dir = "./build"
+
+# flags = []
+# include_dirs = []
+# lib_dirs = []
+# libs = []
+
+[[bin]]
+name = "my_app"
+path = "/src/main.cpp""#;

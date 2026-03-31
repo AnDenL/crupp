@@ -32,4 +32,6 @@ pub enum Commands {
         #[arg(short, long, default_value = "Crub.toml")]
         manifest: String,
     },
+    /// Generate Crub.toml
+    Toml,
 }

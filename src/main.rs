@@ -5,6 +5,7 @@ mod core;
 use clap::Parser;
 use cli::{Cli, Commands};
 use colored::*;
+use tokio::fs;
 
 #[tokio::main]
 async fn main() {
@@ -12,7 +13,7 @@ async fn main() {
 
     match &cli.command {
         Commands::Build { manifest, target } => {
-            println!("{}", "🦀 Crub-graper: Building C++ project...".bright_green());
+            println!("{}", "Building C++ project...".bright_green());
             if let Err(e) = core::builder::build_project(manifest, target.as_deref()).await {
                 eprintln!("{} {}", "❌ Build failed:".red().bold(), e);
                 std::process::exit(1);
@@ -31,8 +32,15 @@ async fn main() {
             }
         }
         Commands::Compdb { manifest } => {
-            println!("{}", "🦀 Crub-graper: Generating compile_commands.json...".bright_green());
+            println!("{}", "Generating compile_commands.json...".bright_green());
             if let Err(e) = core::builder::export_compdb(manifest).await {
+                eprintln!("{} {}", "❌ Generation failed:".red().bold(), e);
+                std::process::exit(1);
+            }
+        }
+        Commands::Toml => {
+            println!("{}", "Generating Crub.toml...".bright_green());
+            if let Err(e) = fs::write("Crub.toml", config::DEFAULT).await {
                 eprintln!("{} {}", "❌ Generation failed:".red().bold(), e);
                 std::process::exit(1);
             }
