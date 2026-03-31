@@ -26,18 +26,18 @@ Make Crub.toml file in your project it should look like this
 [package]
 compiler = "clang++" # or g++ any you want
 standard = "-std=c++2b" # c++ standart
-source_dir = "./" 
+source_dir = "./src/" 
 out_dir = "./build"
 
 # Compilation flags and libraries, any you need
-flags = ["-Wall", "-O3"]
-include_dirs = ["./include", "/usr/local/include"]
-lib_dirs = ["/usr/local/lib"]
-libs = ["pthread", "fmt"]
+# flags = []
+# include_dirs = []
+# lib_dirs = []
+# libs = []
 
 [[bin]]
 name = "main" # app name
-path = "/cpp/main.cpp" # your main file
+path = "/src/main.cpp" # your main file
 ```
 And
 ```bash
@@ -46,6 +46,10 @@ crub-graper build
 or
 ```bash
 crub-graper run
+``` 
+Also you can make compilation_commands.json for your language server
+```bash
+crub-graper compdb
 ```
 
 ### Is it compatible with C?
