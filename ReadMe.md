@@ -1,5 +1,5 @@
-## CRUB-GRAPER
-Fcking cmake on rust(or no, haven't used cmake). Made to ease c++ development with it's new features like modules.
+## CRUPP
+Made to ease c++ development with it's new features like modules.
 
 **Why rust?**
 
