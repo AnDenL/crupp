@@ -1,10 +1,11 @@
-use super::scanner::{discover_sources, TranslationUnit};
-use crate::config::{CompilerType, Package, load_manifest};
+use super::scanner::{TranslationUnit, discover_sources};
+use crate::config::{BinTarget, CompilerType, Language, Package, load_manifest_or_autodetect};
 use colored::*;
 use futures::future::join_all;
+use indicatif::{ProgressBar, ProgressStyle};
+use petgraph::Direction;
 use petgraph::algo::{tarjan_scc, toposort};
 use petgraph::graph::{DiGraph, NodeIndex};
-use petgraph::Direction;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -12,13 +13,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::process::Command;
-use indicatif::{ProgressBar, ProgressStyle};
 
 struct BuildContext {
-    compiler: CompilerType,
-    standard: String,
-    flags: Vec<String>,
-    include_dirs: Vec<String>,
+    package: Package,
     obj_dir: PathBuf,
     pb: ProgressBar,
 }
@@ -31,23 +28,81 @@ struct CompileCommand {
     output: String,
 }
 
-pub async fn build_project(manifest_path: &str, _target_name: Option<&str>) -> Result<(), String> {
-    let manifest = load_manifest(manifest_path)?;
-    let pkg = &manifest.package;
+pub async fn build_project(manifest_path: &str, target_name: Option<&str>) -> Result<(), String> {
+    let (mut manifest, is_autodetected) = load_manifest_or_autodetect(manifest_path)?;
+
+    let pkg = &mut manifest.package;
+    if is_autodetected {
+        println!(
+            "{}",
+            "  No Crub.toml found. Running in auto-detected mode...".yellow()
+        );
+    }
+
+    if pkg.include_dirs.is_empty() {
+        pkg.include_dirs = super::scanner::auto_discover_include_dirs(Path::new("."), &pkg.out_dir);
+    }
 
     let build_dir = PathBuf::from(&pkg.out_dir);
     let obj_dir = build_dir.join("obj");
-    fs::create_dir_all(&obj_dir).map_err(|e| format!("Failed to create obj dir: {}", e))?;
+    fs::create_dir_all(&obj_dir).map_err(|e| format!("Failed to create build dir: {}", e))?;
 
-    let units = discover_sources(&pkg.source_dir, pkg);
-    if units.is_empty() {
-        return Err("No C++ source files found in the source directory.".to_string());
+    let mut units = discover_sources(&pkg.source_dir, pkg);
+
+    for bin in &manifest.bin {
+        let clean = bin.path.trim_start_matches("./");
+        let p = PathBuf::from(clean);
+        if p.exists() && !units.iter().any(|u| u.path.ends_with(&p)) {
+            if let Some(unit) = super::scanner::scan_file(&p, pkg) {
+                units.push(unit);
+            }
+        }
     }
 
-    let mut graph = DiGraph::<usize, ()>::new();
+    if units.is_empty() {
+        return Err(format!(
+            "No C or C++ source files found in '{}'.\n    Tip: Put your files in 'src/' or in the current directory.",
+            pkg.source_dir
+        ));
+    }
+
+    if manifest.bin.is_empty() {
+        manifest.bin = auto_detect_bin_targets(&units, &pkg.name);
+    }
+
+    let targets_to_link: Vec<BinTarget> = if let Some(name) = target_name {
+        let filtered: Vec<BinTarget> = manifest
+            .bin
+            .iter()
+            .filter(|b| b.name == name)
+            .cloned()
+            .collect();
+
+        if filtered.is_empty() {
+            let available: Vec<String> = manifest
+                .bin
+                .iter()
+                .map(|b| format!("'{}'", b.name))
+                .collect();
+            return Err(format!(
+                "Target '{}' not found!\n    Available targets: {}",
+                name.bright_red().bold(),
+                if available.is_empty() {
+                    "none".to_string()
+                } else {
+                    available.join(", ")
+                }
+            ));
+        }
+        filtered
+    } else {
+        manifest.bin.clone()
+    };
+
     let mut module_to_node = HashMap::new();
     let mut path_to_node = HashMap::new();
     let mut node_indices = Vec::new();
+    let mut graph = DiGraph::<usize, ()>::new();
 
     for (i, unit) in units.iter().enumerate() {
         let idx = graph.add_node(i);
@@ -62,6 +117,13 @@ pub async fn build_project(manifest_path: &str, _target_name: Option<&str>) -> R
         for imp in &unit.imports {
             if let Some(&target_idx) = module_to_node.get(imp) {
                 graph.add_edge(target_idx, node_indices[i], ());
+            } else {
+                return Err(format!(
+                    "Module '{}' imported in '{}' does not exist!\n    Tip: Ensure a file has 'export module {};' and is in your source directory.",
+                    imp.bright_red().bold(),
+                    unit.path.display().to_string().cyan(),
+                    imp
+                ));
             }
         }
     }
@@ -70,29 +132,28 @@ pub async fn build_project(manifest_path: &str, _target_name: Option<&str>) -> R
         Ok(ord) => ord,
         Err(_) => {
             let sccs = tarjan_scc(&graph);
-            let cycle = sccs.iter()
+            let cycle = sccs
+                .iter()
                 .find(|scc| scc.len() > 1 || graph.contains_edge(scc[0], scc[0]))
-                .expect("Toposort failed but no SCC found");
+                .expect("Cycle detected");
 
             let mut cycle_info = Vec::new();
             for &node_idx in cycle {
-                let unit_idx = graph[node_idx]; 
-                let unit = &units[unit_idx];
-                
-                let name = unit.exported_module.clone().unwrap_or_else(|| "main".to_string());
-                let path = unit.path.display().to_string();
-                cycle_info.push(format!("{} ({})", name.bright_cyan(), path.dimmed()));
+                let unit = &units[graph[node_idx]];
+                cycle_info.push(format!(
+                    "{} ({})",
+                    unit.exported_module
+                        .as_deref()
+                        .unwrap_or("unit")
+                        .bright_cyan(),
+                    unit.path.display()
+                ));
             }
 
-            let first = cycle_info[0].clone();
-            cycle_info.push(first);
-
-            let error_msg = format!(
-                "\n{}\n{}\n",
-                "Circular dependency detected!".bright_red().bold(),
-                format_cycle_diagram(&cycle_info)
-            );
-            return Err(error_msg);
+            return Err(format!(
+                "Circular module dependency:\n  {}",
+                cycle_info.join(" -> ")
+            ));
         }
     };
 
@@ -110,32 +171,31 @@ pub async fn build_project(manifest_path: &str, _target_name: Option<&str>) -> R
         deep_hashes.insert(node_idx, hex::encode(hasher.finalize()));
     }
 
-    if let Err(e) = write_compdb(pkg, &units, &deep_hashes, &node_indices, &obj_dir) {
-        println!("{}", format!("⚠️ Warning: Failed to generate compile_commands.json: {}", e).yellow());
-    }
+    let _ = write_compdb(pkg, &units, &deep_hashes, &node_indices, &obj_dir);
 
-    let total_nodes = graph.node_count() as u64;
-    let pb = ProgressBar::new(total_nodes);
+    let pb = ProgressBar::new(graph.node_count() as u64);
     pb.set_style(
         ProgressStyle::default_bar()
-            .template("{spinner:.cyan.bold} [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) {msg:.yellow}")
+            .template(
+                "{spinner:.cyan.bold} [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) {msg:.yellow}",
+            )
             .unwrap_or_else(|_| ProgressStyle::default_bar())
-            .progress_chars("=>-")
+            .progress_chars("=>-"),
     );
-    pb.set_message("Compiling C++ chaos...");
+    pb.set_message("Compiling project...");
 
     let build_ctx = Arc::new(BuildContext {
-        compiler: pkg.compiler.clone(),
-        standard: pkg.standard.clone(),
-        flags: pkg.flags.clone(),
-        include_dirs: pkg.include_dirs.clone(),
+        package: pkg.clone(),
         obj_dir: obj_dir.clone(),
-        pb: pb.clone(), 
+        pb: pb.clone(),
     });
 
     let mut in_degrees: HashMap<NodeIndex, usize> = HashMap::new();
     for node in graph.node_indices() {
-        in_degrees.insert(node, graph.edges_directed(node, Direction::Incoming).count());
+        in_degrees.insert(
+            node,
+            graph.edges_directed(node, Direction::Incoming).count(),
+        );
     }
 
     let mut completed = HashSet::new();
@@ -143,7 +203,6 @@ pub async fn build_project(manifest_path: &str, _target_name: Option<&str>) -> R
 
     while completed.len() < graph.node_count() {
         let mut current_wave = Vec::new();
-
         for node in graph.node_indices() {
             if !completed.contains(&node) && in_degrees[&node] == 0 {
                 current_wave.push(node);
@@ -152,29 +211,29 @@ pub async fn build_project(manifest_path: &str, _target_name: Option<&str>) -> R
 
         if current_wave.is_empty() {
             pb.finish_and_clear();
-            return Err("Deadlock detected during parallel compilation!".to_string());
+            return Err("Deadlock detected during task graph execution!".to_string());
         }
 
         let mut tasks = Vec::new();
-
         for &node_idx in &current_wave {
             let unit = units[graph[node_idx]].clone();
             let deep_hash = deep_hashes[&node_idx].clone();
             let ctx = Arc::clone(&build_ctx);
 
             tasks.push(tokio::spawn(async move {
-                compile_unit(ctx, unit, deep_hash).await.map(|obj_path| (node_idx, obj_path))
+                compile_unit(ctx, unit, deep_hash)
+                    .await
+                    .map(|obj_path| (node_idx, obj_path))
             }));
         }
 
-        let wave_results = join_all(tasks).await;
-
-        for res in wave_results {
+        for res in join_all(tasks).await {
             match res {
                 Ok(Ok((node_idx, obj_path))) => {
                     obj_files_map.insert(node_idx, obj_path);
                     completed.insert(node_idx);
-                    pb.inc(1); // Оновлюємо прогрес-бар
+                    pb.inc(1);
+
                     for neighbor in graph.neighbors_directed(node_idx, Direction::Outgoing) {
                         *in_degrees.get_mut(&neighbor).unwrap() -= 1;
                     }
@@ -185,74 +244,83 @@ pub async fn build_project(manifest_path: &str, _target_name: Option<&str>) -> R
                 }
                 Err(e) => {
                     pb.finish_and_clear();
-                    return Err(format!("Task panicked: {}", e));
+                    return Err(format!("Compilation task failed: {}", e));
                 }
             }
         }
     }
 
     pb.finish_and_clear();
-    println!("{}", "Compiling finished. Linking targets...".bright_cyan());
+    println!(
+        "{}",
+        "Compiled successfully. Linking targets...".bright_cyan()
+    );
 
-    if manifest.bin.is_empty() {
-        println!("{}", "⚠️ Compiled successfully, but no [[bin]] targets found for linking.".yellow());
-    }
+    let has_any_cpp = units.iter().any(|u| u.language == Language::Cpp);
+    let linker_cmd = if has_any_cpp {
+        pkg.compiler.cpp_compiler()
+    } else {
+        pkg.compiler.c_compiler()
+    };
 
-    // Збираємо точки входу (entry_nodes) для всіх бінарників, щоб розділити їх
-    let mut entry_nodes = HashMap::new();
-    for bin in &manifest.bin {
-        let clean_bin_path = bin.path.trim_start_matches('/');
-        let target_path = PathBuf::from(clean_bin_path);
-        
-        if let Some((_, &node)) = path_to_node.iter().find(|(path, _)| path.ends_with(&target_path)) {
-            entry_nodes.insert(bin.name.clone(), node);
-        }
-    }
+    let all_main_nodes: HashSet<NodeIndex> = units
+        .iter()
+        .enumerate()
+        .filter(|(_, u)| u.has_main)
+        .map(|(i, _)| node_indices[i])
+        .collect();
 
-    for bin in &manifest.bin {
+    for bin in &targets_to_link {
+        let clean_path = bin.path.trim_start_matches("./").trim_start_matches('/');
+        let target_path = PathBuf::from(clean_path);
+
+        let target_node = path_to_node
+            .iter()
+            .find(|(p, _)| p.ends_with(&target_path))
+            .map(|(_, &node)| node);
+
         let out_path = build_dir.join(&bin.name);
         println!("{:>12} {}", "Linking".magenta().bold(), bin.name);
 
-        if !entry_nodes.contains_key(&bin.name) {
-            return Err(format!("Main file '{}' for target '{}' not found in source directory.", bin.path, bin.name));
-        };
-
         let mut required_objects = Vec::new();
-        
-        // Нова логіка: лінкуємо всі об'єктні файли, ОКРІМ тих, які є entry_point для ІНШИХ бінарників
         for (node, obj_path) in &obj_files_map {
-            let is_other_entry = entry_nodes.iter().any(|(name, &n)| name != &bin.name && n == *node);
-            if !is_other_entry {
-                required_objects.push(obj_path.clone());
+            if all_main_nodes.contains(node) && Some(*node) != target_node {
+                continue;
+            }
+            required_objects.push(obj_path.clone());
+        }
+
+        let mut cmd = Command::new(&linker_cmd);
+        for flag in &pkg.flags {
+            for part in flag.split_whitespace() {
+                cmd.arg(part);
             }
         }
-
-        let mut cmd = Command::new(&pkg.compiler.as_string());
-        cmd.arg(&pkg.standard);
-
-        for flag in &pkg.flags {
-            cmd.arg(flag);
-        }
-
         for obj in &required_objects {
             cmd.arg(obj);
         }
-
         cmd.arg("-o").arg(&out_path);
-
         for lib_dir in &pkg.lib_dirs {
             cmd.arg(format!("-L{}", lib_dir));
         }
 
-        for lib in &pkg.libs {
+        let mut effective_libs = pkg.libs.clone();
+        if cfg!(target_family = "unix") && !effective_libs.iter().any(|l| l == "m") {
+            effective_libs.push("m".to_string());
+        }
+        for lib in &effective_libs {
             cmd.arg(format!("-l{}", lib));
         }
 
-        let output = cmd.output().await.map_err(|e| e.to_string())?;
+        let output = cmd
+            .output()
+            .await
+            .map_err(|e| explain_io_error(&linker_cmd, e))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            println!("{}\n", stderr.dimmed());
+            eprintln!("\n{}", stderr.dimmed());
+            explain_linker_error(&stderr);
             return Err(format!("Failed to link target '{}'", bin.name));
         }
     }
@@ -261,58 +329,245 @@ pub async fn build_project(manifest_path: &str, _target_name: Option<&str>) -> R
     Ok(())
 }
 
-pub async fn export_compdb(manifest_path: &str) -> Result<(), String> {
-    let manifest = load_manifest(manifest_path)?;
-    let pkg = &manifest.package;
-
-    let build_dir = PathBuf::from(&pkg.out_dir);
-    let obj_dir = build_dir.join("obj");
-
-    let units = discover_sources(&pkg.source_dir, pkg);
-    if units.is_empty() {
-        return Err("No C++ source files found in the source directory.".to_string());
+pub fn clean_project(manifest_path: &str) -> Result<(), String> {
+    let (manifest, _) = load_manifest_or_autodetect(manifest_path)?;
+    let out_dir = PathBuf::from(&manifest.package.out_dir);
+    if out_dir.exists() {
+        fs::remove_dir_all(&out_dir)
+            .map_err(|e| format!("Failed to remove '{}': {}", out_dir.display(), e))?;
+        println!("{:>12} '{}'", "Removed".green().bold(), out_dir.display());
+    } else {
+        println!("{:>12} (already clean)", "Finished".bright_green().bold());
     }
-
-    let mut graph = DiGraph::<usize, ()>::new();
-    let mut module_to_node = HashMap::new();
-    let mut node_indices = Vec::new();
-
-    for (i, unit) in units.iter().enumerate() {
-        let idx = graph.add_node(i);
-        node_indices.push(idx);
-        if let Some(mod_name) = &unit.exported_module {
-            module_to_node.insert(mod_name.clone(), idx);
-        }
-    }
-
-    for (i, unit) in units.iter().enumerate() {
-        for imp in &unit.imports {
-            if let Some(&target_idx) = module_to_node.get(imp) {
-                graph.add_edge(target_idx, node_indices[i], ());
-            }
-        }
-    }
-
-    let order = toposort(&graph, None).map_err(|_| "🔄 Cyclic dependency detected in your C++ modules!".to_string())?;
-
-    let mut deep_hashes: HashMap<NodeIndex, String> = HashMap::new();
-    for &node_idx in &order {
-        let unit_idx = graph[node_idx];
-        let mut hasher = Sha256::new();
-        hasher.update(&units[unit_idx].base_hash);
-
-        for neighbor in graph.neighbors_directed(node_idx, Direction::Incoming) {
-            if let Some(dep_hash) = deep_hashes.get(&neighbor) {
-                hasher.update(dep_hash);
-            }
-        }
-        deep_hashes.insert(node_idx, hex::encode(hasher.finalize()));
-    }
-
-    write_compdb(pkg, &units, &deep_hashes, &node_indices, &obj_dir)?;
-    
-    println!("{}", "compile_commands.json generated successfully!".bright_green());
     Ok(())
+}
+
+fn auto_detect_bin_targets(units: &[TranslationUnit], default_name: &str) -> Vec<BinTarget> {
+    let main_units: Vec<&TranslationUnit> = units.iter().filter(|u| u.has_main).collect();
+    if main_units.is_empty() {
+        if units.len() == 1 {
+            return vec![BinTarget {
+                name: default_name.to_string(),
+                path: units[0].path.to_string_lossy().to_string(),
+            }];
+        }
+        return vec![];
+    }
+
+    if main_units.len() == 1 {
+        return vec![BinTarget {
+            name: default_name.to_string(),
+            path: main_units[0].path.to_string_lossy().to_string(),
+        }];
+    }
+
+    main_units
+        .iter()
+        .map(|u| {
+            let file_stem = u.path.file_stem().and_then(|s| s.to_str()).unwrap_or("app");
+            let target_name = if file_stem == "main" {
+                u.path
+                    .parent()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(default_name)
+                    .to_string()
+            } else {
+                file_stem.to_string()
+            };
+
+            BinTarget {
+                name: target_name,
+                path: u.path.to_string_lossy().to_string(),
+            }
+        })
+        .collect()
+}
+
+async fn compile_unit(
+    ctx: Arc<BuildContext>,
+    unit: TranslationUnit,
+    deep_hash: String,
+) -> Result<PathBuf, String> {
+    let safe_name = unit
+        .path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unit")
+        .replace('.', "_");
+
+    let hash_prefix = &deep_hash[0..8];
+    let obj_name = format!("{}_{}.o", safe_name, hash_prefix);
+    let obj_path = ctx.obj_dir.join(&obj_name);
+    let cache_file = ctx.obj_dir.join(format!("{}.hash", safe_name));
+
+    let is_cached = if let Ok(cached) = fs::read_to_string(&cache_file) {
+        let mut valid = obj_path.exists();
+        if let Language::Cpp = unit.language {
+            if let CompilerType::Clang = ctx.package.compiler {
+                if let Some(mod_name) = &unit.exported_module {
+                    valid = valid && ctx.obj_dir.join(format!("{}.pcm", mod_name)).exists();
+                }
+            }
+        }
+        cached == deep_hash && valid
+    } else {
+        false
+    };
+
+    if is_cached {
+        ctx.pb.suspend(|| {
+            println!(
+                "{:>12} {}",
+                "Cached".bright_blue().bold(),
+                unit.path.display()
+            );
+        });
+        return Ok(obj_path);
+    }
+
+    ctx.pb.suspend(|| {
+        println!("{:>12} {}", "Compiling".green().bold(), unit.path.display());
+    });
+
+    let (compiler_bin, standard, lang_flags) = match unit.language {
+        Language::C => (
+            ctx.package.compiler.c_compiler(),
+            &ctx.package.c_standard,
+            &ctx.package.c_flags,
+        ),
+        Language::Cpp => (
+            ctx.package.compiler.cpp_compiler(),
+            &ctx.package.standard,
+            &ctx.package.cpp_flags,
+        ),
+    };
+
+    let mut cmd = Command::new(&compiler_bin);
+    cmd.arg(standard).arg("-c");
+
+    for flag in &ctx.package.flags {
+        for part in flag.split_whitespace() {
+            cmd.arg(part);
+        }
+    }
+    for flag in lang_flags {
+        for part in flag.split_whitespace() {
+            cmd.arg(part);
+        }
+    }
+    for inc in &ctx.package.include_dirs {
+        cmd.arg(format!("-I{}", inc));
+    }
+
+    if unit.language == Language::Cpp {
+        let is_export = unit.exported_module.is_some();
+        let module_flags =
+            ctx.package
+                .compiler
+                .get_module_flags(&ctx.obj_dir, is_export, &unit.exported_module);
+        cmd.args(module_flags);
+    }
+
+    cmd.arg(&unit.path).arg("-o").arg(&obj_path);
+
+    let output = cmd
+        .output()
+        .await
+        .map_err(|e| explain_io_error(&compiler_bin, e))?;
+
+    if output.status.success() {
+        let _ = fs::write(cache_file, &deep_hash);
+        Ok(obj_path)
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        ctx.pb.suspend(|| {
+            eprintln!(
+                "\n{} {}",
+                "  Error compiling".red().bold(),
+                unit.path.display()
+            );
+            eprintln!("{}", stderr);
+        });
+        Err(format!(
+            "Compilation stopped due to errors in {}",
+            unit.path.display()
+        ))
+    }
+}
+
+fn explain_io_error(binary: &str, err: std::io::Error) -> String {
+    if err.kind() == std::io::ErrorKind::NotFound {
+        format!(
+            "Compiler executable '{}' was not found in PATH!\n    Solution: Install it (`sudo pacman -S clang gcc`) or adjust 'compiler' in Crub.toml.",
+            binary
+        )
+    } else {
+        format!("Failed to execute '{}': {}", binary, err)
+    }
+}
+
+fn explain_linker_error(stderr: &str) {
+    let tips = [
+        (
+            "undefined reference to `sin'",
+            "Missing math functions. Add libs = [\"m\"] in Crub.toml.",
+        ),
+        (
+            "undefined reference to `cos'",
+            "Missing math functions. Add libs = [\"m\"] in Crub.toml.",
+        ),
+        (
+            "undefined reference to `sqrt'",
+            "Missing math functions. Add libs = [\"m\"] in Crub.toml.",
+        ),
+        (
+            "undefined reference to `pthread_",
+            "Missing POSIX threads. Add flags = [\"-pthread\"] or libs = [\"pthread\"].",
+        ),
+        (
+            "undefined reference to `dlopen'",
+            "Missing dynamic loader. Add libs = [\"dl\"].",
+        ),
+        (
+            "undefined reference to `main'",
+            "No 'main' function found. Ensure your binary source file contains an entry point `int main()`.",
+        ),
+        (
+            "multiple definition of `main'",
+            "Multiple 'main' functions linked together. Declare separate [[bin]] sections in Crub.toml.",
+        ),
+        (
+            "undefined reference to `SDL_",
+            "Missing SDL2 library. Add libs = [\"SDL2\"] in Crub.toml.",
+        ),
+        (
+            "undefined reference to `glBegin'",
+            "Missing OpenGL. Add libs = [\"GL\"] in Crub.toml.",
+        ),
+        (
+            "undefined reference to `glCreateShader'",
+            "Missing OpenGL. Add libs = [\"GL\"] in Crub.toml.",
+        ),
+        (
+            "undefined reference to `vkCreateInstance'",
+            "Missing Vulkan loader. Add libs = [\"vulkan\"] in Crub.toml.",
+        ),
+        (
+            "undefined reference to `XOpenDisplay'",
+            "Missing X11. Add libs = [\"X11\"] in Crub.toml.",
+        ),
+        (
+            "undefined reference to `InitWindow'",
+            "Missing Raylib. Add libs = [\"raylib\"] in Crub.toml.",
+        ),
+    ];
+
+    for (needle, hint) in &tips {
+        if stderr.contains(needle) {
+            println!("    {} {}", "Tip:".yellow().bold(), hint.yellow());
+        }
+    }
 }
 
 fn write_compdb(
@@ -322,147 +577,71 @@ fn write_compdb(
     node_indices: &[NodeIndex],
     obj_dir: &Path,
 ) -> Result<(), String> {
-    let current_dir_path = std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."));
-    let current_dir_str = current_dir_path.to_string_lossy().to_string();
+    let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let current_dir_str = current_dir.to_string_lossy().to_string();
 
     let mut commands = Vec::new();
-
     for (i, unit) in units.iter().enumerate() {
         let node_idx = node_indices[i];
         let deep_hash = &deep_hashes[&node_idx];
-        
-        let safe_name = unit.path.file_stem()
+        let safe_name = unit
+            .path
+            .file_stem()
             .and_then(|s| s.to_str())
-            .ok_or_else(|| format!("Can't get file name for path: {:?}", unit.path))?
+            .unwrap_or("unit")
             .replace('.', "_");
 
-        let hash_prefix = &deep_hash[0..8];
-        let obj_name = format!("{}_{}.o", safe_name, hash_prefix);
-        
-        let abs_file = fs::canonicalize(&unit.path)
-            .unwrap_or_else(|_| current_dir_path.join(&unit.path));
-        let abs_file_str = abs_file.to_string_lossy().to_string();
+        let obj_name = format!("{}_{}.o", safe_name, &deep_hash[0..8]);
+        let abs_file =
+            fs::canonicalize(&unit.path).unwrap_or_else(|_| current_dir.join(&unit.path));
+        let abs_output = current_dir.join(obj_dir).join(&obj_name);
 
-        let abs_output = current_dir_path.join(obj_dir).join(&obj_name);
-        let abs_output_str = abs_output.to_string_lossy().to_string();
+        let (compiler_bin, standard) = match unit.language {
+            Language::C => (pkg.compiler.c_compiler(), &pkg.c_standard),
+            Language::Cpp => (pkg.compiler.cpp_compiler(), &pkg.standard),
+        };
 
-        let mut args = vec![
-            pkg.compiler.as_string(),
-            pkg.standard.clone(),
-            "-c".to_string(),
-        ];
-        
+        let mut args = vec![compiler_bin, standard.clone(), "-c".to_string()];
         args.extend(pkg.flags.clone());
-        
         for inc in &pkg.include_dirs {
-            let abs_inc = current_dir_path.join(inc);
-            args.push(format!("-I{}", abs_inc.to_string_lossy()));
+            args.push(format!("-I{}", current_dir.join(inc).to_string_lossy()));
         }
-        let abs_obj_dir = current_dir_path.join(obj_dir);
-        args.extend(pkg.compiler.get_flags(&abs_obj_dir, &unit));
-
-        args.push(abs_file_str.clone());
+        args.push(abs_file.to_string_lossy().to_string());
         args.push("-o".to_string());
-        args.push(abs_output_str.clone());
+        args.push(abs_output.to_string_lossy().to_string());
 
         commands.push(CompileCommand {
             directory: current_dir_str.clone(),
             arguments: args,
-            file: abs_file_str,
-            output: abs_output_str, 
+            file: abs_file.to_string_lossy().to_string(),
+            output: abs_output.to_string_lossy().to_string(),
         });
     }
 
-    let json = serde_json::to_string_pretty(&commands)
-        .map_err(|e| format!("Failed to serialize compile_commands.json: {}", e))?;
-    
-    fs::write(current_dir_path.join("compile_commands.json"), json)
-        .map_err(|e| format!("Failed to write compile_commands.json: {}", e))?;
-
+    let json = serde_json::to_string_pretty(&commands).map_err(|e| e.to_string())?;
+    let _ = fs::write(current_dir.join("compile_commands.json"), json);
     Ok(())
 }
 
-async fn compile_unit(
-    ctx: Arc<BuildContext>,
-    unit: TranslationUnit,
-    deep_hash: String,
-) -> Result<PathBuf, String> {
-    let safe_name = unit.path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| format!("Can't get file name for path: {:?}", unit.path))?
-        .replace('.', "_");
-    let hash_prefix = &deep_hash[0..8];
-    let obj_name = format!("{}_{}.o", safe_name, hash_prefix);
-    
-    let obj_path = ctx.obj_dir.join(&obj_name);
-    let cache_file = ctx.obj_dir.join(format!("{}.hash", safe_name));
+pub async fn export_compdb(manifest_path: &str) -> Result<(), String> {
+    let (manifest, _) = load_manifest_or_autodetect(manifest_path)?;
+    let pkg = &manifest.package;
+    let obj_dir = PathBuf::from(&pkg.out_dir).join("obj");
+    let units = discover_sources(&pkg.source_dir, pkg);
 
-    let is_cached = if let Ok(cached_hash) = fs::read_to_string(&cache_file) {
-        let mut valid = obj_path.exists();
-        match ctx.compiler {
-            CompilerType::Clang => {
-                if let Some(mod_name) = &unit.exported_module {
-                    let pcm_path = ctx.obj_dir.join(format!("{}.pcm", mod_name));
-                    valid = valid && pcm_path.exists();
-                }
-            }
-            _ => {},
-        }
-        cached_hash == deep_hash && valid
-    } else {
-        false
-    };
+    let mut deep_hashes = HashMap::new();
+    let mut node_indices = Vec::new();
 
-    if is_cached {
-        ctx.pb.println(format!("{:>12} {}", "Cached".bright_blue().bold(), unit.path.display()));
-        return Ok(obj_path);
+    for (i, u) in units.iter().enumerate() {
+        let n = NodeIndex::new(i);
+        node_indices.push(n);
+        deep_hashes.insert(n, u.base_hash.clone());
     }
 
-    ctx.pb.println(format!("{:>12} {}", "Compiling".green().bold(), unit.path.display()));
-
-    let mut cmd = Command::new(&ctx.compiler.as_string());
-    cmd.arg(&ctx.standard).arg("-c");
-
-    for flag in &ctx.flags {
-        cmd.arg(flag);
-    }
-
-    for inc_dir in &ctx.include_dirs {
-        cmd.arg(format!("-I{}", inc_dir));
-    }
-
-    let module_flags = ctx.compiler.get_flags(&ctx.obj_dir, &unit);
-    cmd.args(module_flags);
-
-    cmd.arg(&unit.path).arg("-o").arg(&obj_path);
-
-    let output = cmd.output().await.map_err(|e| format!("Failed to spawn compiler: {}", e))?;
-
-    if output.status.success() {
-        fs::write(cache_file, &deep_hash).map_err(|e| e.to_string())?;
-        Ok(obj_path)
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        ctx.pb.println(format!("\n{} {}", "❌ Error compiling".red().bold(), unit.path.display()));
-        ctx.pb.println(format!("{}", stderr));
-        Err(format!("Compilation aborted for {}", unit.path.display()))
-    }
-}
-
-fn format_cycle_diagram(path: &[String]) -> String {
-    let mut diagram = String::new();
-    let indent = "      ";
-    
-    for (i, module) in path.iter().enumerate() {
-        if i == 0 {
-            diagram.push_str(&format!("{}┌──→ {}\n", indent, module.bright_cyan()));
-        } else if i == path.len() - 1 {
-            diagram.push_str(&format!("{}└─── {}\n", indent, module.bright_cyan()));
-        } else {
-            diagram.push_str(&format!("{}│    {}\n", indent, module.bright_cyan()));
-        }
-    }
-    diagram
+    write_compdb(pkg, &units, &deep_hashes, &node_indices, &obj_dir)?;
+    println!(
+        "{}",
+        "compile_commands.json generated successfully!".bright_green()
+    );
+    Ok(())
 }

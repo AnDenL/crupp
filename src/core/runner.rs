@@ -1,34 +1,51 @@
-use crate::config::load_manifest;
+use crate::config::load_manifest_or_autodetect;
 use std::path::PathBuf;
 use tokio::process::Command;
 
-pub async fn run_target(manifest_path: &str, target_name: Option<&str>) -> Result<(), String> {
-    let manifest = load_manifest(manifest_path)?;
-    
-    if manifest.bin.is_empty() {
-        return Err("No [[bin]] targets found in configuration!".to_string());
-    }
+pub async fn run_target(
+    manifest_path: &str,
+    target_name: Option<&str>,
+    args: &[String],
+) -> Result<(), String> {
+    let (manifest, _) = load_manifest_or_autodetect(manifest_path)?;
+    let build_dir = PathBuf::from(&manifest.package.out_dir);
 
-    let bin_target = if let Some(name) = target_name {
-        manifest.bin.iter().find(|b| b.name == name)
-            .ok_or_else(|| format!("Target '{}' not found", name))?
+    let target_bin_name = if let Some(name) = target_name {
+        name.to_string()
+    } else if let Some(first_bin) = manifest.bin.first() {
+        first_bin.name.clone()
     } else {
-        &manifest.bin[0]
+        manifest.package.name.clone()
     };
 
-    let bin_path = PathBuf::from(&manifest.package.out_dir).join(&bin_target.name);
-
+    let bin_path = build_dir.join(&target_bin_name);
     if !bin_path.exists() {
-        return Err("Executable not found. Did the build fail?".to_string());
+        return Err(format!(
+            "Binary '{}' not found at '{}'. Run build first or check if compilation produced an output.",
+            target_bin_name,
+            bin_path.display()
+        ));
     }
 
-    let mut cmd = Command::new(&bin_path);    
-    let mut child = cmd.spawn().map_err(|e| format!("Failed to spawn process: {}", e))?;
-    let status = child.wait().await.map_err(|e| format!("Process wait error: {}", e))?;
+    let mut cmd = Command::new(&bin_path);
+    cmd.args(args);
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to spawn executable '{}': {}", bin_path.display(), e))?;
+
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| format!("Process wait error: {}", e))?;
 
     if status.success() {
         Ok(())
     } else {
-        Err(format!("Exit code: {}", status.code().unwrap_or(-1)))
+        Err(format!(
+            "Process '{}' exited with status code {}",
+            target_bin_name,
+            status.code().unwrap_or(-1)
+        ))
     }
 }

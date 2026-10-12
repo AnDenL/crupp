@@ -1,29 +1,29 @@
 /*
-                                                                                                    
-                                                                                                    
-                                                                                                    
-                                                                                                    
-                       ..                                                                           
-               ..    ..-:.                           .*<.                                           
-               ...   ..:=-                         ^{}~ .:~^^+                                      
-                 :.  .-.:~.                     +]@@@@@@@@@@@@@@@@@#=     :                         
-                 .-:. .~-~:                  ]@@@@@@@@@@@@@@@@@@@@@@@%)                             
-                  :-: -~.-.             )>{@@@@@@@@@@@@@@@@@@@@@@@@@@@@)-                           
-                  .~=:.. .-            .{@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@%)                          
-                   ~=~-~  ~~:         @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@%#                          
-                   .=-=~= .=-       @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@+^                         
-                    ~-^^*-         @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@%~):                       
-                     -+]>+        @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@}{<                      
-                     :)=+        =@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@<                    
-         .            .           @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@%##%#@@@@@@@@#:    -             
-         .              :         @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@{@).    (@@@@@@@@-    -            
-        .                         @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@(  }@@{   @@@@@@@@^   *:           
-        ..                       ~@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@  @@  @@: @@@@@@@@@)   ~           
-        .:                       ]@@@@@@#}-   .=%@@@@@@@@@@@@@@@@  @@@@@@-)@@@@@@@@@#~  .           
-         -.                      .@@@@@[[  *@@@@]@@@@@@@@@@@@@@@@{    :=<@@@@@@@@@@@@#              
-                                  @@@@@@*  @@ -@)[@@@@@@@@@@@@@@@@@@%@@@@@@@@@@@@@@@@@(             
-                                  {@@@@@%   %@@-~{@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@+            
-                                  #@@@@@@@~   +^%@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@]            
+
+
+
+
+                       ..
+               ..    ..-:.                           .*<.
+               ...   ..:=-                         ^{}~ .:~^^+
+                 :.  .-.:~.                     +]@@@@@@@@@@@@@@@@@#=     :
+                 .-:. .~-~:                  ]@@@@@@@@@@@@@@@@@@@@@@@%)
+                  :-: -~.-.             )>{@@@@@@@@@@@@@@@@@@@@@@@@@@@@)-
+                  .~=:.. .-            .{@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@%)
+                   ~=~-~  ~~:         @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@%#
+                   .=-=~= .=-       @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@+^
+                    ~-^^*-         @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@%~):
+                     -+]>+        @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@}{<
+                     :)=+        =@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@<
+         .            .           @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@%##%#@@@@@@@@#:    -
+         .              :         @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@{@).    (@@@@@@@@-    -
+        .                         @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@(  }@@{   @@@@@@@@^   *:
+        ..                       ~@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@  @@  @@: @@@@@@@@@)   ~
+        .:                       ]@@@@@@#}-   .=%@@@@@@@@@@@@@@@@  @@@@@@-)@@@@@@@@@#~  .
+         -.                      .@@@@@[[  *@@@@]@@@@@@@@@@@@@@@@{    :=<@@@@@@@@@@@@#
+                                  @@@@@@*  @@ -@)[@@@@@@@@@@@@@@@@@@%@@@@@@@@@@@@@@@@@(
+                                  {@@@@@%   %@@-~{@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@+
+                                  #@@@@@@@~   +^%@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@]
                                   @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@{         @[=
                                  .@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@%>       .@@@
                                   @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@#.       @@@
@@ -57,38 +57,49 @@ use tokio::fs;
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
-
     match &cli.command {
         Commands::Build { manifest, target } => {
-            println!("{}", "Building C++ project...".bright_green());
+            println!("{}", "🚀 Building project...".bright_green().bold());
             if let Err(e) = core::builder::build_project(manifest, target.as_deref()).await {
-                eprintln!("{} {}", "❌ Build failed:".red().bold(), e);
+                eprintln!("\n{} {}", "❌ Build failed:".red().bold(), e);
                 std::process::exit(1);
             }
         }
-        Commands::Run { manifest, target } => {
+        Commands::Run {
+            manifest,
+            target,
+            args,
+        } => {
             if let Err(e) = core::builder::build_project(manifest, target.as_deref()).await {
-                eprintln!("{} {}", "❌ Cannot run: build failed:".red().bold(), e);
+                eprintln!("\n{} {}", "❌ Cannot run (build failed):".red().bold(), e);
                 std::process::exit(1);
             }
-
-            println!("{}", "Running target...".bright_cyan());
-            if let Err(e) = core::runner::run_target(manifest, target.as_deref()).await {
-                eprintln!("{} {}", "Program terminated unexpectedly:".red().bold(), e);
+            println!("{}", "▶️  Running target...".bright_cyan().bold());
+            if let Err(e) = core::runner::run_target(manifest, target.as_deref(), args).await {
+                eprintln!("\n{} {}", "❌ Target error:".red().bold(), e);
+                std::process::exit(1);
+            }
+        }
+        Commands::Clean { manifest } => {
+            if let Err(e) = core::builder::clean_project(manifest) {
+                eprintln!("\n{} {}", "❌ Clean failed:".red().bold(), e);
                 std::process::exit(1);
             }
         }
         Commands::Compdb { manifest } => {
-            println!("{}", "Generating compile_commands.json...".bright_green());
+            println!(
+                "{}",
+                "📄 Generating compile_commands.json...".bright_green()
+            );
             if let Err(e) = core::builder::export_compdb(manifest).await {
-                eprintln!("{} {}", "❌ Generation failed:".red().bold(), e);
+                eprintln!("{} {}", "Generation failed:".red().bold(), e);
                 std::process::exit(1);
             }
         }
         Commands::Toml { name } => {
-            println!("{}", "Generating Crub.toml...".bright_green());
+            println!("{}", "📝 Generating Crub.toml...".bright_green());
             if let Err(e) = fs::write("Crub.toml", config::default_with_name(name)).await {
-                eprintln!("{} {}", "❌ Generation failed:".red().bold(), e);
+                eprintln!("{} {}", "Generation failed:".red().bold(), e);
                 std::process::exit(1);
             }
         }

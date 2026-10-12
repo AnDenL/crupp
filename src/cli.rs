@@ -1,7 +1,11 @@
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "crupp", version = "0.2", about = "A Cargo-like build system for C++")]
+#[command(
+    name = "crupp",
+    version = "0.2.1",
+    about = "A lightning-fast Cargo-like build system for C and C++"
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
@@ -9,30 +13,42 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    /// Build the project (compile + link)
+    /// Build targets in the project (compile + link)
     Build {
-        #[arg(short, long, default_value = "Crub.toml")]
-        manifest: String,
-        
-        /// Build a specific target (e.g., binary name)
-        #[arg(short, long)]
-        target: Option<String>,
-    },
-    /// Build and run the project
-    Run {
+        /// Path to configuration manifest
         #[arg(short, long, default_value = "Crub.toml")]
         manifest: String,
 
-        /// Run a specific target
-        #[arg(short, long)]
+        /// Build a specific target (binary name)
+        #[arg(short = 't', long = "target", alias = "bin")]
         target: Option<String>,
     },
-    /// Generate compile_commands.json for VS Code / clangd
+    /// Build and run a specific target
+    Run {
+        /// Path to configuration manifest
+        #[arg(short, long, default_value = "Crub.toml")]
+        manifest: String,
+
+        /// Run a specific target (defaults to first binary)
+        #[arg(short = 't', long = "target", alias = "bin")]
+        target: Option<String>,
+
+        /// Arguments passed to the target executable
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
+    /// Remove build artifacts and compiler cache
+    Clean {
+        /// Path to configuration manifest
+        #[arg(short, long, default_value = "Crub.toml")]
+        manifest: String,
+    },
+    /// Generate compile_commands.json for VS Code / clangd / Neovim
     Compdb {
         #[arg(short, long, default_value = "Crub.toml")]
         manifest: String,
     },
-    /// Generate Crub.toml
+    /// Generate Crub.toml template
     Toml {
         #[arg(default_value = "my_app")]
         name: String,
