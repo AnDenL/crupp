@@ -59,7 +59,7 @@ async fn main() {
     let cli = Cli::parse();
     match &cli.command {
         Commands::Build { manifest, target } => {
-            println!("{}", "🚀 Building project...".bright_green().bold());
+            println!("{}", "Building project...".bright_green().bold());
             if let Err(e) = core::builder::build_project(manifest, target.as_deref()).await {
                 eprintln!("\n{} {}", "❌ Build failed:".red().bold(), e);
                 std::process::exit(1);
@@ -87,17 +87,14 @@ async fn main() {
             }
         }
         Commands::Compdb { manifest } => {
-            println!(
-                "{}",
-                "📄 Generating compile_commands.json...".bright_green()
-            );
+            println!("{}", "Generating compile_commands.json...".bright_green());
             if let Err(e) = core::builder::export_compdb(manifest).await {
                 eprintln!("{} {}", "Generation failed:".red().bold(), e);
                 std::process::exit(1);
             }
         }
         Commands::Toml { name } => {
-            println!("{}", "📝 Generating Crub.toml...".bright_green());
+            println!("{}", "Generating Crub.toml...".bright_green());
             if let Err(e) = fs::write("Crub.toml", config::default_with_name(name)).await {
                 eprintln!("{} {}", "Generation failed:".red().bold(), e);
                 std::process::exit(1);

@@ -61,6 +61,17 @@ Also you can make compilation_commands.json for your language server
 crupp compdb
 ```
 
+If you want to run specific binary:
+```bash
+crupp run -t name
+```
+
+And finaly clean
+```bash
+crupp clean
+```
+cleans all cache
+
 ### Is it compatible with C?
 
-Maybe
+Yes!

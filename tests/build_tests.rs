@@ -186,8 +186,8 @@ fn test_cache_and_benchmark() {
         .stdout(predicate::str::contains("Cached"));
     let warm_duration = start_warm.elapsed();
 
-    println!("\n  ⚡ Cold build: {:?}", cold_duration);
-    println!("  ⚡ Cached build: {:?}", warm_duration);
+    println!("\n  Cold build: {:?}", cold_duration);
+    println!("  Cached build: {:?}", warm_duration);
 
     assert!(warm_duration < cold_duration);
 }
