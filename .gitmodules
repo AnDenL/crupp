@@ -1,0 +1,3 @@
+[submodule "vendor/tcc"]
+	path = vendor/tcc
+	url = https://github.com/Tiny-C-Compiler/tinycc-mirror-repository.git

@@ -1,0 +1,12 @@
+[package]
+name = "my_app"
+compiler = "clang"
+standard = "-std=c++23"
+c_standard = "-std=c17"
+source_dir = "./src"
+out_dir = "./build"
+flags = ["-Wall", "-Wextra"]
+
+[[bin]]
+name = "my_app"
+path = "src/main.c"

@@ -1,1 +1,3 @@
 /target
+/tests/examples/*/build
+/tests/examples/*/.cache

@@ -30,8 +30,8 @@ struct CompileCommand {
 
 pub async fn build_project(manifest_path: &str, target_name: Option<&str>) -> Result<(), String> {
     let (mut manifest, is_autodetected) = load_manifest_or_autodetect(manifest_path)?;
-
     let pkg = &mut manifest.package;
+
     if is_autodetected {
         println!(
             "{}",
@@ -61,7 +61,7 @@ pub async fn build_project(manifest_path: &str, target_name: Option<&str>) -> Re
 
     if units.is_empty() {
         return Err(format!(
-            "No C or C++ source files found in '{}'.\n    Tip: Put your files in 'src/' or in the current directory.",
+            "No C or C++ source files found in '{}'.",
             pkg.source_dir
         ));
     }
@@ -77,7 +77,6 @@ pub async fn build_project(manifest_path: &str, target_name: Option<&str>) -> Re
             .filter(|b| b.name == name)
             .cloned()
             .collect();
-
         if filtered.is_empty() {
             let available: Vec<String> = manifest
                 .bin
@@ -119,10 +118,9 @@ pub async fn build_project(manifest_path: &str, target_name: Option<&str>) -> Re
                 graph.add_edge(target_idx, node_indices[i], ());
             } else {
                 return Err(format!(
-                    "Module '{}' imported in '{}' does not exist!\n    Tip: Ensure a file has 'export module {};' and is in your source directory.",
+                    "Module '{}' imported in '{}' does not exist!",
                     imp.bright_red().bold(),
-                    unit.path.display().to_string().cyan(),
-                    imp
+                    unit.path.display().to_string().cyan()
                 ));
             }
         }
@@ -157,12 +155,11 @@ pub async fn build_project(manifest_path: &str, target_name: Option<&str>) -> Re
         }
     };
 
-    let mut deep_hashes: HashMap<NodeIndex, String> = HashMap::new();
+    let mut deep_hashes = HashMap::new();
     for &node_idx in &order {
         let unit_idx = graph[node_idx];
         let mut hasher = Sha256::new();
         hasher.update(&units[unit_idx].base_hash);
-
         for neighbor in graph.neighbors_directed(node_idx, Direction::Incoming) {
             if let Some(dep_hash) = deep_hashes.get(&neighbor) {
                 hasher.update(dep_hash);
@@ -219,7 +216,6 @@ pub async fn build_project(manifest_path: &str, target_name: Option<&str>) -> Re
             let unit = units[graph[node_idx]].clone();
             let deep_hash = deep_hashes[&node_idx].clone();
             let ctx = Arc::clone(&build_ctx);
-
             tasks.push(tokio::spawn(async move {
                 compile_unit(ctx, unit, deep_hash)
                     .await
@@ -233,7 +229,6 @@ pub async fn build_project(manifest_path: &str, target_name: Option<&str>) -> Re
                     obj_files_map.insert(node_idx, obj_path);
                     completed.insert(node_idx);
                     pb.inc(1);
-
                     for neighbor in graph.neighbors_directed(node_idx, Direction::Outgoing) {
                         *in_degrees.get_mut(&neighbor).unwrap() -= 1;
                     }
@@ -249,8 +244,8 @@ pub async fn build_project(manifest_path: &str, target_name: Option<&str>) -> Re
             }
         }
     }
-
     pb.finish_and_clear();
+
     println!(
         "{}",
         "Compiled successfully. Linking targets...".bright_cyan()
@@ -273,7 +268,6 @@ pub async fn build_project(manifest_path: &str, target_name: Option<&str>) -> Re
     for bin in &targets_to_link {
         let clean_path = bin.path.trim_start_matches("./").trim_start_matches('/');
         let target_path = PathBuf::from(clean_path);
-
         let target_node = path_to_node
             .iter()
             .find(|(p, _)| p.ends_with(&target_path))
@@ -316,7 +310,6 @@ pub async fn build_project(manifest_path: &str, target_name: Option<&str>) -> Re
             .output()
             .await
             .map_err(|e| explain_io_error(&linker_cmd, e))?;
-
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             eprintln!("\n{}", stderr.dimmed());
@@ -375,7 +368,6 @@ fn auto_detect_bin_targets(units: &[TranslationUnit], default_name: &str) -> Vec
             } else {
                 file_stem.to_string()
             };
-
             BinTarget {
                 name: target_name,
                 path: u.path.to_string_lossy().to_string(),
@@ -395,7 +387,6 @@ async fn compile_unit(
         .and_then(|s| s.to_str())
         .unwrap_or("unit")
         .replace('.', "_");
-
     let hash_prefix = &deep_hash[0..8];
     let obj_name = format!("{}_{}.o", safe_name, hash_prefix);
     let obj_path = ctx.obj_dir.join(&obj_name);
@@ -430,6 +421,32 @@ async fn compile_unit(
         println!("{:>12} {}", "Compiling".green().bold(), unit.path.display());
     });
 
+    let raw_source = fs::read_to_string(&unit.path).map_err(|e| e.to_string())?;
+    let file_to_compile = if super::comptime::has_comptime_markers(&raw_source) {
+        let gen_dir = ctx.obj_dir.join("gen");
+        fs::create_dir_all(&gen_dir).map_err(|e| e.to_string())?;
+
+        let transformed_code = super::comptime::transform_comptime(
+            &raw_source,
+            &ctx.package.include_dirs,
+            &ctx.obj_dir,
+            &unit.path,
+        )?;
+
+        let shadow_file = gen_dir.join(unit.path.file_name().unwrap());
+        let abs_orig = fs::canonicalize(&unit.path).unwrap_or_else(|_| unit.path.clone());
+        let final_shadow_code = format!(
+            "#line 1 \"{}\"\n{}",
+            abs_orig.to_string_lossy(),
+            transformed_code
+        );
+
+        fs::write(&shadow_file, final_shadow_code).map_err(|e| e.to_string())?;
+        shadow_file
+    } else {
+        unit.path.clone()
+    };
+
     let (compiler_bin, standard, lang_flags) = match unit.language {
         Language::C => (
             ctx.package.compiler.c_compiler(),
@@ -445,7 +462,6 @@ async fn compile_unit(
 
     let mut cmd = Command::new(&compiler_bin);
     cmd.arg(standard).arg("-c");
-
     for flag in &ctx.package.flags {
         for part in flag.split_whitespace() {
             cmd.arg(part);
@@ -456,8 +472,17 @@ async fn compile_unit(
             cmd.arg(part);
         }
     }
+
+    cmd.arg("-DCOMPTIME=0");
+    cmd.arg("-Dcomptime(x)=(x)");
+    cmd.arg("-Dtcc(x)=(x)");
+    cmd.arg(&file_to_compile).arg("-o").arg(&obj_path);
+
     for inc in &ctx.package.include_dirs {
         cmd.arg(format!("-I{}", inc));
+    }
+    if let Some(parent) = unit.path.parent() {
+        cmd.arg(format!("-I{}", parent.display()));
     }
 
     if unit.language == Language::Cpp {
@@ -468,8 +493,6 @@ async fn compile_unit(
                 .get_module_flags(&ctx.obj_dir, is_export, &unit.exported_module);
         cmd.args(module_flags);
     }
-
-    cmd.arg(&unit.path).arg("-o").arg(&obj_path);
 
     let output = cmd
         .output()
@@ -531,7 +554,7 @@ fn explain_linker_error(stderr: &str) {
         ),
         (
             "undefined reference to `main'",
-            "No 'main' function found. Ensure your binary source file contains an entry point `int main()`.",
+            "No 'main' function found. Ensure a source file defines 'int main()'.",
         ),
         (
             "multiple definition of `main'",
@@ -562,7 +585,6 @@ fn explain_linker_error(stderr: &str) {
             "Missing Raylib. Add libs = [\"raylib\"] in Crub.toml.",
         ),
     ];
-
     for (needle, hint) in &tips {
         if stderr.contains(needle) {
             println!("    {} {}", "Tip:".yellow().bold(), hint.yellow());
@@ -579,8 +601,8 @@ fn write_compdb(
 ) -> Result<(), String> {
     let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let current_dir_str = current_dir.to_string_lossy().to_string();
-
     let mut commands = Vec::new();
+
     for (i, unit) in units.iter().enumerate() {
         let node_idx = node_indices[i];
         let deep_hash = &deep_hashes[&node_idx];
@@ -590,7 +612,6 @@ fn write_compdb(
             .and_then(|s| s.to_str())
             .unwrap_or("unit")
             .replace('.', "_");
-
         let obj_name = format!("{}_{}.o", safe_name, &deep_hash[0..8]);
         let abs_file =
             fs::canonicalize(&unit.path).unwrap_or_else(|_| current_dir.join(&unit.path));
@@ -601,7 +622,14 @@ fn write_compdb(
             Language::Cpp => (pkg.compiler.cpp_compiler(), &pkg.standard),
         };
 
-        let mut args = vec![compiler_bin, standard.clone(), "-c".to_string()];
+        let mut args = vec![
+            compiler_bin,
+            standard.clone(),
+            "-c".to_string(),
+            "-DCOMPTIME=0".to_string(),
+            "-Dcomptime(x)=(x)".to_string(),
+            "-Dtcc(x)=(x)".to_string(),
+        ];
         args.extend(pkg.flags.clone());
         for inc in &pkg.include_dirs {
             args.push(format!("-I{}", current_dir.join(inc).to_string_lossy()));
@@ -631,7 +659,6 @@ pub async fn export_compdb(manifest_path: &str) -> Result<(), String> {
 
     let mut deep_hashes = HashMap::new();
     let mut node_indices = Vec::new();
-
     for (i, u) in units.iter().enumerate() {
         let n = NodeIndex::new(i);
         node_indices.push(n);

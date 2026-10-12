@@ -8,7 +8,6 @@ export module HeavyMeta;
 
 export namespace meta {
 
-// 1. Концепти та варіативні шаблони
 template <typename T>
 concept Number = std::integral<T> || std::floating_point<T>;
 
@@ -17,7 +16,6 @@ struct TypeList {
     static constexpr std::size_t size = sizeof...(Ts);
 };
 
-// 2. Рекурсивне шаблонне дерево для навантаження AST
 template <int N, int Branch = 0>
 struct TemplateTree {
     static constexpr long long value =
@@ -30,7 +28,6 @@ struct TemplateTree<0, Branch> {
     static constexpr long long value = Branch * 7 + 3;
 };
 
-// 3. NTTP та constexpr обчислення
 template <std::size_t Dim>
 struct ConstMatrix {
     long long data[Dim][Dim]{};
@@ -68,4 +65,4 @@ constexpr long long calculate_trace() {
     return m.trace();
 }
 
-} // namespace meta
+}
