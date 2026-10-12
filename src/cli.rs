@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(
     name = "crupp",
-    version = "0.2.1",
+    version = "0.3.0",
     about = "A lightning-fast Cargo-like build system for C and C++"
 )]
 pub struct Cli {
