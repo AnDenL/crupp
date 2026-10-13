@@ -11,11 +11,12 @@
       "-Wall",
       "-Wextra",
       "-I/home/den/Documents/GitHub/crub-graper/tests/examples/comptime/.",
+      "-I/home/den/Documents/GitHub/crub-graper/tests/examples/comptime/src",
       "/home/den/Documents/GitHub/crub-graper/tests/examples/comptime/src/main.c",
       "-o",
-      "/home/den/Documents/GitHub/crub-graper/tests/examples/comptime/./build/obj/main_e54cc29b.o"
+      "/home/den/Documents/GitHub/crub-graper/tests/examples/comptime/./build/obj/src_main_c_cb693c64.o"
     ],
     "file": "/home/den/Documents/GitHub/crub-graper/tests/examples/comptime/src/main.c",
-    "output": "/home/den/Documents/GitHub/crub-graper/tests/examples/comptime/./build/obj/main_e54cc29b.o"
+    "output": "/home/den/Documents/GitHub/crub-graper/tests/examples/comptime/./build/obj/src_main_c_cb693c64.o"
   }
 ]

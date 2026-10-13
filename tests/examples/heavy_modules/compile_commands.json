@@ -9,12 +9,13 @@
       "-Dcomptime(x)=(x)",
       "-Dtcc(x)=(x)",
       "-I/home/den/Documents/GitHub/crub-graper/tests/examples/heavy_modules/.",
+      "-I/home/den/Documents/GitHub/crub-graper/tests/examples/heavy_modules/src",
       "/home/den/Documents/GitHub/crub-graper/tests/examples/heavy_modules/src/heavy_meta.cppm",
       "-o",
-      "/home/den/Documents/GitHub/crub-graper/tests/examples/heavy_modules/./build/obj/heavy_meta_3f3caf64.o"
+      "/home/den/Documents/GitHub/crub-graper/tests/examples/heavy_modules/./build/obj/src_heavy_meta_cppm_e7920735.o"
     ],
     "file": "/home/den/Documents/GitHub/crub-graper/tests/examples/heavy_modules/src/heavy_meta.cppm",
-    "output": "/home/den/Documents/GitHub/crub-graper/tests/examples/heavy_modules/./build/obj/heavy_meta_3f3caf64.o"
+    "output": "/home/den/Documents/GitHub/crub-graper/tests/examples/heavy_modules/./build/obj/src_heavy_meta_cppm_e7920735.o"
   },
   {
     "directory": "/home/den/Documents/GitHub/crub-graper/tests/examples/heavy_modules",
@@ -26,11 +27,12 @@
       "-Dcomptime(x)=(x)",
       "-Dtcc(x)=(x)",
       "-I/home/den/Documents/GitHub/crub-graper/tests/examples/heavy_modules/.",
+      "-I/home/den/Documents/GitHub/crub-graper/tests/examples/heavy_modules/src",
       "/home/den/Documents/GitHub/crub-graper/tests/examples/heavy_modules/src/main.cpp",
       "-o",
-      "/home/den/Documents/GitHub/crub-graper/tests/examples/heavy_modules/./build/obj/main_7b94e67f.o"
+      "/home/den/Documents/GitHub/crub-graper/tests/examples/heavy_modules/./build/obj/src_main_cpp_00b48a30.o"
     ],
     "file": "/home/den/Documents/GitHub/crub-graper/tests/examples/heavy_modules/src/main.cpp",
-    "output": "/home/den/Documents/GitHub/crub-graper/tests/examples/heavy_modules/./build/obj/main_7b94e67f.o"
+    "output": "/home/den/Documents/GitHub/crub-graper/tests/examples/heavy_modules/./build/obj/src_main_cpp_00b48a30.o"
   }
 ]

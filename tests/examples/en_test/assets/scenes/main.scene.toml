@@ -1,0 +1,96 @@
+[[entity]]
+[entity.camera]
+x = 0.0
+y = 0.0
+zoom = 64.0
+
+
+[[entity]]
+[entity.transform]
+x = -6.0
+y = 0.0
+[entity.sprite]
+texture = "assets/test.png"
+width = 1.0
+height = 1.0
+
+[[entity]]
+[entity.transform]
+x = -4.8
+y = 0.0
+[entity.sprite]
+texture = "assets/test.png"
+width = 1.0
+height = 1.0
+
+[[entity]]
+[entity.transform]
+x = -3.6
+y = 0.0
+[entity.sprite]
+texture = "assets/test.png"
+width = 1.0
+height = 1.0
+
+[[entity]]
+[entity.transform]
+x = -2.4
+y = 0.0
+[entity.sprite]
+texture = "assets/test.png"
+width = 1.0
+height = 1.0
+
+[[entity]]
+[entity.transform]
+x = -1.2
+y = 0.0
+[entity.sprite]
+texture = "assets/test.png"
+width = 1.0
+height = 1.0
+
+[[entity]]
+[entity.transform]
+x = 0.0
+y = 0.0
+[entity.sprite]
+texture = "assets/test.png"
+width = 1.0
+height = 1.0
+
+[[entity]]
+[entity.transform]
+x = 1.2
+y = 0.0
+[entity.sprite]
+texture = "assets/test.png"
+width = 1.0
+height = 1.0
+
+[[entity]]
+[entity.transform]
+x = 2.4
+y = 0.0
+[entity.sprite]
+texture = "assets/test.png"
+width = 1.0
+height = 1.0
+
+[[entity]]
+[entity.transform]
+x = 3.6
+y = 0.0
+[entity.sprite]
+texture = "assets/test.png"
+width = 1.0
+height = 1.0
+
+[[entity]]
+[entity.transform]
+x = 4.8
+y = 0.0
+[entity.sprite]
+texture = "assets/test.png"
+width = 1.0
+height = 1.0

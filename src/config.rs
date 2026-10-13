@@ -1,6 +1,8 @@
+use colored::*;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Language {
@@ -8,7 +10,24 @@ pub enum Language {
     Cpp,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildProfile {
+    Default,
+    Debug,
+    Release,
+}
+
+impl BuildProfile {
+    pub fn flags(&self) -> Vec<String> {
+        match self {
+            BuildProfile::Default => vec![],
+            BuildProfile::Debug => vec!["-g".into(), "-O0".into(), "-DDEBUG=1".into()],
+            BuildProfile::Release => vec!["-O3".into(), "-DNDEBUG=1".into()],
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct Manifest {
     #[serde(default)]
     pub package: Package,
@@ -16,7 +35,7 @@ pub struct Manifest {
     pub bin: Vec<BinTarget>,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct Package {
     #[serde(default = "default_name")]
     pub name: String,
@@ -50,12 +69,15 @@ fn default_name() -> String {
         .and_then(|p| p.file_name().map(|s| s.to_string_lossy().to_string()))
         .unwrap_or_else(|| "app".to_string())
 }
+
 fn default_cpp_standard() -> String {
     "-std=c++23".to_string()
 }
+
 fn default_c_standard() -> String {
     "-std=c17".to_string()
 }
+
 fn default_source_dir() -> String {
     if Path::new("src").is_dir() {
         "src".to_string()
@@ -63,6 +85,7 @@ fn default_source_dir() -> String {
         ".".to_string()
     }
 }
+
 fn default_out_dir() -> String {
     "build".to_string()
 }
@@ -111,7 +134,7 @@ impl Package {
     }
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct BinTarget {
     pub name: String,
     pub path: String,
@@ -128,16 +151,22 @@ pub enum CompilerType {
 
 impl Default for CompilerType {
     fn default() -> Self {
-        if std::process::Command::new("clang")
-            .arg("--version")
-            .output()
-            .is_ok()
-        {
+        if is_command_available("clang") {
             CompilerType::Clang
-        } else {
+        } else if is_command_available("gcc") {
             CompilerType::Gcc
+        } else {
+            CompilerType::Clang
         }
     }
+}
+
+fn is_command_available(cmd: &str) -> bool {
+    Command::new(cmd)
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 impl CompilerType {
@@ -165,6 +194,46 @@ impl CompilerType {
         }
     }
 
+    /// Resolves the actual C compiler binary to run, with intelligent fallback
+    /// if the configured compiler is missing from PATH.
+    pub fn resolve_c_compiler(&self) -> (String, Option<String>) {
+        let requested = self.c_compiler();
+        if is_command_available(&requested) {
+            return (requested, None);
+        }
+
+        // Fallback resolution
+        if requested == "clang" && is_command_available("gcc") {
+            let note = "⚠️  'clang' was not found in PATH; automatically using 'gcc' as fallback.".yellow().to_string();
+            return ("gcc".to_string(), Some(note));
+        } else if requested == "gcc" && is_command_available("clang") {
+            let note = "⚠️  'gcc' was not found in PATH; automatically using 'clang' as fallback.".yellow().to_string();
+            return ("clang".to_string(), Some(note));
+        }
+
+        (requested, None)
+    }
+
+    /// Resolves the actual C++ compiler binary to run, with intelligent fallback
+    /// if the configured compiler is missing from PATH.
+    pub fn resolve_cpp_compiler(&self) -> (String, Option<String>) {
+        let requested = self.cpp_compiler();
+        if is_command_available(&requested) {
+            return (requested, None);
+        }
+
+        // Fallback resolution
+        if requested == "clang++" && is_command_available("g++") {
+            let note = "⚠️  'clang++' was not found in PATH; automatically using 'g++' as fallback.".yellow().to_string();
+            return ("g++".to_string(), Some(note));
+        } else if requested == "g++" && is_command_available("clang++") {
+            let note = "⚠️  'g++' was not found in PATH; automatically using 'clang++' as fallback.".yellow().to_string();
+            return ("clang++".to_string(), Some(note));
+        }
+
+        (requested, None)
+    }
+
     pub fn get_module_flags(
         &self,
         obj_dir: &Path,
@@ -190,32 +259,66 @@ impl CompilerType {
             }
             args
         } else {
-            vec![]
+            // GCC C++20 modules support
+            let is_gcc = match self {
+                CompilerType::Gcc => true,
+                CompilerType::Custom(cmd) => cmd.contains("gcc") || cmd.contains("g++"),
+                _ => false,
+            };
+            if is_gcc {
+                vec!["-fmodules-ts".to_string()]
+            } else {
+                vec![]
+            }
         }
     }
 }
 
+/// Finds the manifest file, checking common variants (Crub.toml, crupp.toml, Crupp.toml)
+pub fn locate_manifest<P: AsRef<Path>>(requested: P) -> Option<PathBuf> {
+    let req = requested.as_ref();
+    if req.exists() {
+        return Some(req.to_path_buf());
+    }
+
+    // Common fallback names
+    let candidates = ["Crub.toml", "crupp.toml", "Crupp.toml", "crub.toml"];
+    for name in &candidates {
+        let p = Path::new(name);
+        if p.exists() {
+            return Some(p.to_path_buf());
+        }
+    }
+
+    None
+}
+
 pub fn load_manifest_or_autodetect<P: AsRef<Path>>(path: P) -> Result<(Manifest, bool), String> {
-    let path_ref = path.as_ref();
-    if !path_ref.exists() {
+    let manifest_path = locate_manifest(path);
+
+    let Some(actual_path) = manifest_path else {
+        // Auto-detect mode
+        let mut pkg = Package::default();
+        pkg.normalize_standards();
         return Ok((
             Manifest {
-                package: Package::default(),
+                package: pkg,
                 bin: vec![],
             },
             true,
         ));
-    }
+    };
 
-    let content = fs::read_to_string(path_ref)
-        .map_err(|e| format!("Could not read configuration file: {}", e))?;
+    let content = fs::read_to_string(&actual_path)
+        .map_err(|e| format!("Could not read configuration file '{}': {}", actual_path.display(), e))?;
 
     let mut manifest: Manifest = toml::from_str(&content).map_err(|e| {
-            format!(
-                "Syntax error in Crub.toml:\n  {}\n  💡 Tip: Check for missing commas, unclosed quotes, or brackets.",
-                e
-            )
-        })?;
+        format!(
+            "Syntax error in '{}':\n  {}\n  💡 Tip: Check for missing commas, unclosed quotes, or brackets in your TOML config.",
+            actual_path.display(),
+            e
+        )
+    })?;
 
     manifest.package.normalize_standards();
 
@@ -223,19 +326,42 @@ pub fn load_manifest_or_autodetect<P: AsRef<Path>>(path: P) -> Result<(Manifest,
 }
 
 pub fn default_with_name(name: &str) -> String {
+    default_with_name_and_lang(name, None)
+}
+
+pub fn default_with_name_and_lang(name: &str, lang_pref: Option<&str>) -> String {
+    let preferred_compiler = if is_command_available("clang") {
+        "clang"
+    } else {
+        "gcc"
+    };
+
+    // Auto-detect if user has C or C++ sources
+    let is_c = if let Some(l) = lang_pref {
+        l == "c"
+    } else {
+        Path::new("src/main.c").exists() || Path::new("main.c").exists()
+    };
+
+    let (standard_c, standard_cpp, main_path) = if is_c {
+        ("-std=c17", "-std=c++23", "src/main.c")
+    } else {
+        ("-std=c17", "-std=c++23", "src/main.cpp")
+    };
+
     format!(
         r#"[package]
 name = "{name}"
-compiler = "clang"
-standard = "-std=c++23"
-c_standard = "-std=c17"
+compiler = "{preferred_compiler}"
+standard = "{standard_cpp}"
+c_standard = "{standard_c}"
 source_dir = "./src"
 out_dir = "./build"
 flags = ["-Wall", "-Wextra"]
 
 [[bin]]
 name = "{name}"
-path = "src/main.c"
+path = "{main_path}"
 "#
     )
 }
