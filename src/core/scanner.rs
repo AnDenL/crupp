@@ -3,7 +3,7 @@ use regex::Regex;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
@@ -215,7 +215,7 @@ fn get_or_compute_header_hash(path: &Path) -> Option<String> {
     let metadata = fs::metadata(path).ok()?;
     let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
 
-    if let Ok(mut cache) = get_header_cache().lock() {
+    if let Ok(cache) = get_header_cache().lock() {
         if let Some((cached_mtime, cached_hash)) = cache.get(path) {
             if *cached_mtime == mtime {
                 return Some(cached_hash.clone());

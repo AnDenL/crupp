@@ -7,7 +7,7 @@ pub mod ops;
 pub mod options;
 
 pub use compdb::export_compdb;
-pub use ops::{check_project, clean_project, clean_project_with_all};
+pub use ops::{check_project, clean_project_with_all};
 pub use options::BuildOptions;
 
 use self::compiler::compile_unit;
@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{Semaphore, mpsc};
 
-pub async fn build_project(manifest_path: &str, target_name: Option<&str>) -> Result<(), String> {
+pub async fn _build_project(manifest_path: &str, target_name: Option<&str>) -> Result<(), String> {
     build_project_with_options(BuildOptions {
         manifest_path,
         target_name,
@@ -39,7 +39,6 @@ pub async fn build_project(manifest_path: &str, target_name: Option<&str>) -> Re
 pub async fn build_project_with_options(opts: BuildOptions<'_>) -> Result<(), String> {
     let start_time = Instant::now();
     let (mut manifest, is_autodetected) = load_manifest_or_autodetect(opts.manifest_path)?;
-    let pkg = &mut manifest.package;
 
     if is_autodetected {
         println!(
@@ -48,21 +47,25 @@ pub async fn build_project_with_options(opts: BuildOptions<'_>) -> Result<(), St
         );
     }
 
-    if pkg.include_dirs.is_empty() {
-        pkg.include_dirs = auto_discover_include_dirs(Path::new("."), &pkg.out_dir);
+    if manifest.package.include_dirs.is_empty() {
+        manifest.package.include_dirs =
+            auto_discover_include_dirs(Path::new("."), &manifest.package.out_dir);
     } else {
-        pkg.include_dirs.retain(|d| !d.trim().is_empty());
+        manifest
+            .package
+            .include_dirs
+            .retain(|d| !d.trim().is_empty());
     }
-    pkg.lib_dirs.retain(|d| !d.trim().is_empty());
-    pkg.libs.retain(|l| !l.trim().is_empty());
+    manifest.package.lib_dirs.retain(|d| !d.trim().is_empty());
+    manifest.package.libs.retain(|l| !l.trim().is_empty());
 
-    let build_dir = PathBuf::from(&pkg.out_dir);
+    let build_dir = PathBuf::from(&manifest.package.out_dir);
     let obj_dir = build_dir.join("obj");
     fs::create_dir_all(&obj_dir).map_err(|e| format!("Failed to create build dir: {}", e))?;
 
     let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut seen_canonical = HashSet::new();
-    let mut units = discover_sources(&pkg.source_dir, pkg);
+    let mut units = discover_sources(&manifest.package.source_dir, &manifest.package);
 
     // 1. Initial canonical deduplication and relative path normalization for discovered units
     units.retain_mut(|u| {
@@ -88,7 +91,7 @@ pub async fn build_project_with_options(opts: BuildOptions<'_>) -> Result<(), St
                 } else {
                     p
                 };
-                if let Some(unit) = crate::core::scanner::scan_file(&clean_p, pkg) {
+                if let Some(unit) = crate::core::scanner::scan_file(&clean_p, &manifest.package) {
                     units.push(unit);
                 }
             }
@@ -112,7 +115,8 @@ pub async fn build_project_with_options(opts: BuildOptions<'_>) -> Result<(), St
                                 } else {
                                     candidate
                                 };
-                                if let Some(tu) = crate::core::scanner::scan_file(&clean_cand, pkg)
+                                if let Some(tu) =
+                                    crate::core::scanner::scan_file(&clean_cand, &manifest.package)
                                 {
                                     extra_sources.push(tu);
                                 }
@@ -128,12 +132,12 @@ pub async fn build_project_with_options(opts: BuildOptions<'_>) -> Result<(), St
     if units.is_empty() {
         return Err(format!(
             "No C or C++ source files found in '{}'.\n  💡 Tip: Create your source files in 'src/' or specify 'source_dir' in Crub.toml.",
-            pkg.source_dir
+            manifest.package.source_dir
         ));
     }
 
     if manifest.bin.is_empty() {
-        manifest.bin = auto_detect_bin_targets(&units, &pkg.name);
+        manifest.bin = auto_detect_bin_targets(&units, &manifest.package.name);
     }
 
     let targets_to_link: Vec<BinTarget> = if let Some(name) = opts.target_name {
@@ -164,14 +168,16 @@ pub async fn build_project_with_options(opts: BuildOptions<'_>) -> Result<(), St
         manifest.bin.clone()
     };
 
+    let profile_flags = manifest.resolve_profile_flags(&opts.profile);
+
     // Construct DAG & perform topological sort with cycle detection
-    let build_graph = build_dependency_graph(&units, &pkg.source_dir)?;
+    let build_graph = build_dependency_graph(&units, &manifest.package.source_dir)?;
     let order = sort_and_detect_cycles(&build_graph.graph, &units)?;
-    let deep_hashes = compute_deep_hashes(&build_graph.graph, &units, &order, opts.profile);
+    let deep_hashes = compute_deep_hashes(&build_graph.graph, &units, &order, &profile_flags);
 
     // Auto-sync compile_commands.json
     let _ = compdb::write_compdb(
-        pkg,
+        &manifest.package,
         &units,
         &deep_hashes,
         &build_graph.node_indices,
@@ -197,15 +203,18 @@ pub async fn build_project_with_options(opts: BuildOptions<'_>) -> Result<(), St
     let profile_badge = match opts.profile {
         BuildProfile::Release => " [Release]".bright_magenta().bold(),
         BuildProfile::Debug => " [Debug]".bright_blue().bold(),
+        BuildProfile::Sanitize => " [Sanitize]".bright_red().bold(),
+        BuildProfile::Custom(ref s) => format!(" [{}]", s).bright_yellow().bold(),
         BuildProfile::Default => "".normal(),
     };
     pb.set_message(format!("Compiling project{}...", profile_badge));
 
     let build_ctx = Arc::new(BuildContext {
-        package: pkg.clone(),
+        package: manifest.package.clone(),
         obj_dir: obj_dir.clone(),
         pb: pb.clone(),
-        profile: opts.profile,
+        profile: opts.profile.clone(),
+        profile_flags: profile_flags.clone(),
         verbose: opts.verbose,
         force: opts.force,
     });
@@ -291,14 +300,14 @@ pub async fn build_project_with_options(opts: BuildOptions<'_>) -> Result<(), St
 
     // Link targets
     link_targets(
-        pkg,
+        &manifest.package,
         &targets_to_link,
         &units,
         &build_graph.node_indices,
         &build_graph.path_to_node,
         &obj_files_map,
         &build_dir,
-        opts.profile,
+        &profile_flags,
         opts.verbose,
     )
     .await?;

@@ -26,7 +26,10 @@ pub async fn check_project(
         return Err(format!("No source files found in '{}'.", pkg.source_dir));
     }
 
-    println!("{}", "Checking syntax across translation units...".bright_cyan());
+    println!(
+        "{}",
+        "Checking syntax across translation units...".bright_cyan()
+    );
 
     for unit in &units {
         let (compiler_bin, standard, lang_flags) = match unit.language {
@@ -80,21 +83,31 @@ pub async fn check_project(
             println!("  Checking: {:?}", cmd);
         }
 
-        let output = cmd.output().await.map_err(|e| explain_io_error(&compiler_bin, &e))?;
+        let output = cmd
+            .output()
+            .await
+            .map_err(|e| explain_io_error(&compiler_bin, &e))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            eprintln!("\n{} {}", "Syntax error in".red().bold(), unit.path.display());
+            eprintln!(
+                "\n{} {}",
+                "Syntax error in".red().bold(),
+                unit.path.display()
+            );
             eprintln!("{}", stderr);
             explain_compiler_error(&stderr);
             return Err(format!("Check failed in {}", unit.path.display()));
         }
     }
 
-    println!("{:>12} syntax check (no errors)", "Finished".bright_green().bold());
+    println!(
+        "{:>12} syntax check (no errors)",
+        "Finished".bright_green().bold()
+    );
     Ok(())
 }
 
-pub fn clean_project(manifest_path: &str) -> Result<(), String> {
+pub fn _clean_project(manifest_path: &str) -> Result<(), String> {
     clean_project_with_all(manifest_path, false)
 }
 

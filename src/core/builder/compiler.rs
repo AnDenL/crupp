@@ -116,8 +116,10 @@ pub async fn compile_unit(
             cmd.arg(part);
         }
     }
-    for flag in ctx.profile.flags() {
-        cmd.arg(flag);
+    for flag in &ctx.profile_flags {
+        for part in flag.split_whitespace() {
+            cmd.arg(part);
+        }
     }
 
     cmd.arg("-DCOMPTIME=0");

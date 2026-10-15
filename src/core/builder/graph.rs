@@ -1,4 +1,3 @@
-use crate::config::BuildProfile;
 use crate::core::scanner::TranslationUnit;
 use colored::*;
 use petgraph::Direction;
@@ -93,17 +92,16 @@ pub fn compute_deep_hashes(
     graph: &DiGraph<usize, ()>,
     units: &[TranslationUnit],
     order: &[NodeIndex],
-    profile: BuildProfile,
+    profile_flags: &[String],
 ) -> HashMap<NodeIndex, String> {
     let mut deep_hashes = HashMap::with_capacity(order.len());
-    let profile_flags = profile.flags();
 
     for &node_idx in order {
         let unit_idx = graph[node_idx];
         let mut hasher = Sha256::new();
         hasher.update(&units[unit_idx].base_hash);
-        // Include build profile into deep hash
-        for flag in &profile_flags {
+        // Include build profile flags into deep hash
+        for flag in profile_flags {
             hasher.update(flag.as_bytes());
         }
         for neighbor in graph.neighbors_directed(node_idx, Direction::Incoming) {

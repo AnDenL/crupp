@@ -162,20 +162,39 @@ pub fn execute_c_code(
             }
         }
 
+        // Add project root and CWD to TCC includes
+        let c_dot = CString::new(".").unwrap();
+        tcc_add_include_path(s, c_dot.as_ptr());
+
+        let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let c_cwd = CString::new(current_dir.to_string_lossy().as_bytes()).unwrap_or_default();
+        tcc_add_include_path(s, c_cwd.as_ptr());
+
         for inc in include_dirs {
             let clean = inc.trim().trim_start_matches("-I").trim();
             if !clean.is_empty() {
                 let c_inc = CString::new(clean).unwrap_or_default();
                 tcc_add_include_path(s, c_inc.as_ptr());
+
+                let abs_inc = current_dir.join(clean);
+                if abs_inc.is_dir() {
+                    let c_abs = CString::new(abs_inc.to_string_lossy().as_bytes()).unwrap_or_default();
+                    tcc_add_include_path(s, c_abs.as_ptr());
+                }
             }
         }
+
         if let Some(parent) = origin_file.parent() {
-            let p_str = parent.to_string_lossy();
-            let clean = p_str.trim().trim_start_matches("./").trim();
-            if !clean.is_empty() && clean != "." {
-                let c_parent = CString::new(clean).unwrap_or_default();
-                tcc_add_include_path(s, c_parent.as_ptr());
-            }
+            let c_parent_rel = CString::new(parent.to_string_lossy().as_bytes()).unwrap_or_default();
+            tcc_add_include_path(s, c_parent_rel.as_ptr());
+
+            let abs_parent = if parent.is_relative() {
+                current_dir.join(parent)
+            } else {
+                parent.to_path_buf()
+            };
+            let c_parent_abs = CString::new(abs_parent.to_string_lossy().as_bytes()).unwrap_or_default();
+            tcc_add_include_path(s, c_parent_abs.as_ptr());
         }
 
         let lib_m = CString::new("m").unwrap();

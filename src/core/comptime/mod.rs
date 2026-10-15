@@ -3,7 +3,10 @@ pub mod header;
 pub mod parser;
 pub mod types;
 
-use std::path::Path;
+use regex::Regex;
+use std::collections::HashSet;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 pub fn has_comptime_markers(content: &str) -> bool {
     content.contains("comptime")
@@ -30,10 +33,10 @@ pub fn transform_comptime(
         return Ok(content.to_string());
     }
 
-    // 1. Extract static reflection metadata from C source file
-    let (structs, enums) = parser::parse_c_declarations(content);
+    // 1. Extract static reflection metadata across current file and all transitively included headers
+    let (structs, enums) = collect_all_declarations(content, origin_file, include_dirs);
 
-    // 2. Generate specialized <crupp/comptime.h> header with reflection database & code generators
+    // 2. Generate specialized <comptime.h> header with reflection database & code generators
     let comptime_h = header::generate_comptime_header(&structs, &enums);
     let tcc_home = executor::prepare_embedded_headers(obj_dir, Some(&comptime_h));
 
@@ -72,6 +75,194 @@ pub fn transform_comptime(
     }
 
     Ok(result)
+}
+
+fn collect_all_declarations(
+    content: &str,
+    origin_file: &Path,
+    include_dirs: &[String],
+) -> (Vec<types::CtStruct>, Vec<types::CtEnum>) {
+    let mut all_structs: Vec<types::CtStruct> = Vec::new();
+    let mut all_enums: Vec<types::CtEnum> = Vec::new();
+    let mut seen_struct_names: HashSet<String> = HashSet::new();
+    let mut seen_enum_names: HashSet<String> = HashSet::new();
+
+    let mut visited_headers: HashSet<PathBuf> = HashSet::new();
+    let mut header_queue: Vec<PathBuf> = Vec::new();
+
+    // A. Parse the current file itself
+    let (curr_structs, curr_enums) = parser::parse_c_declarations(content);
+    for s in curr_structs {
+        seen_struct_names.insert(s.name.clone());
+        all_structs.push(s);
+    }
+    for e in curr_enums {
+        seen_enum_names.insert(e.name.clone());
+        all_enums.push(e);
+    }
+
+    // B. Find direct headers from current file
+    find_included_headers(content, origin_file, include_dirs, &mut header_queue, &mut visited_headers);
+
+    // C. Scan configured include directories for project headers (.h, .hpp)
+    let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    for inc_dir in include_dirs {
+        let clean = inc_dir.trim().trim_start_matches("-I").trim();
+        if clean.is_empty() {
+            continue;
+        }
+        let clean_lower = clean.to_ascii_lowercase();
+        if clean_lower.contains("vendor") || clean_lower.contains("third_party") || clean_lower.contains("external") {
+            continue;
+        }
+        let p = Path::new(clean);
+        let search_path = if p.is_relative() {
+            current_dir.join(p)
+        } else {
+            p.to_path_buf()
+        };
+
+        if search_path.is_dir() {
+            for entry in walkdir::WalkDir::new(&search_path)
+                .max_depth(5)
+                .into_iter()
+                .filter_entry(|e| {
+                    if e.depth() == 0 {
+                        return true;
+                    }
+                    let name = e.file_name().to_string_lossy();
+                    if name.starts_with('.') {
+                        return false;
+                    }
+                    let name_lower = name.to_ascii_lowercase();
+                    if name == "target" || name == "build" || name == "build_crupp"
+                        || name_lower == "vendor" || name_lower == "third_party" || name_lower == "external" {
+                        return false;
+                    }
+                    true
+                })
+                .filter_map(|e| e.ok())
+            {
+                let path = entry.path();
+                if path.is_file() {
+                    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                        if matches!(ext, "h" | "hpp" | "hxx" | "hh" | "inl") {
+                            let canon = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+                            if visited_headers.insert(canon.clone()) {
+                                header_queue.push(canon);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // D. Transitive traversal of all discovered headers
+    while let Some(hdr_path) = header_queue.pop() {
+        if let Ok(hdr_bytes) = fs::read(&hdr_path) {
+            let hdr_content = String::from_utf8_lossy(&hdr_bytes);
+            let (h_structs, h_enums) = parser::parse_c_declarations(&hdr_content);
+
+            for s in h_structs {
+                if let Some(pos) = all_structs.iter().position(|x| x.name == s.name) {
+                    // If previous definition had no fields (forward declaration) and this one has fields, replace it!
+                    if all_structs[pos].fields.is_empty() && !s.fields.is_empty() {
+                        all_structs[pos] = s;
+                    } else if !s.attrs.is_empty() {
+                        // Merge attributes if new ones found
+                        for a in s.attrs {
+                            if !all_structs[pos].attrs.iter().any(|x| x.name == a.name) {
+                                all_structs[pos].attrs.push(a);
+                            }
+                        }
+                    }
+                } else {
+                    seen_struct_names.insert(s.name.clone());
+                    all_structs.push(s);
+                }
+            }
+
+            for e in h_enums {
+                if let Some(pos) = all_enums.iter().position(|x| x.name == e.name) {
+                    if all_enums[pos].variants.is_empty() && !e.variants.is_empty() {
+                        all_enums[pos] = e;
+                    }
+                } else {
+                    seen_enum_names.insert(e.name.clone());
+                    all_enums.push(e);
+                }
+            }
+
+            // Inspect nested #includes in this header
+            find_included_headers(&hdr_content, &hdr_path, include_dirs, &mut header_queue, &mut visited_headers);
+        }
+    }
+
+    (all_structs, all_enums)
+}
+
+fn find_included_headers(
+    source_content: &str,
+    current_file: &Path,
+    include_dirs: &[String],
+    queue: &mut Vec<PathBuf>,
+    visited: &mut HashSet<PathBuf>,
+) {
+    let re_inc = Regex::new(r#"^\s*#\s*include\s*["<]([^">]+)[">]"#).unwrap();
+
+    for line in source_content.lines() {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with('#') || !trimmed.contains("include") {
+            continue;
+        }
+
+        if let Some(caps) = re_inc.captures(trimmed) {
+            let inc_name = caps.get(1).unwrap().as_str();
+            if let Some(resolved) = resolve_include_path(inc_name, current_file, include_dirs) {
+                let canon = fs::canonicalize(&resolved).unwrap_or(resolved);
+                if visited.insert(canon.clone()) {
+                    queue.push(canon);
+                }
+            }
+        }
+    }
+}
+
+fn resolve_include_path(inc: &str, current_file: &Path, include_dirs: &[String]) -> Option<PathBuf> {
+    // 1. Relative to current file's parent
+    if let Some(parent) = current_file.parent() {
+        let candidate = parent.join(inc);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
+    // 2. In current directory
+    let cand_cwd = Path::new(".").join(inc);
+    if cand_cwd.is_file() {
+        return Some(cand_cwd);
+    }
+
+    // 3. In each configured include directory
+    let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    for dir in include_dirs {
+        let clean = dir.trim().trim_start_matches("-I").trim();
+        if clean.is_empty() {
+            continue;
+        }
+        let base = Path::new(clean);
+        let candidate = if base.is_relative() {
+            current_dir.join(base).join(inc)
+        } else {
+            base.join(inc)
+        };
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
+    None
 }
 
 fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {

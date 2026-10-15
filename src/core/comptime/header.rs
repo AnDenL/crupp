@@ -1,5 +1,20 @@
 use super::types::{CtEnum, CtStruct};
 
+fn escape_c(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 4);
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 pub fn generate_comptime_header(
     structs: &[CtStruct],
     enums: &[CtEnum],
@@ -77,27 +92,28 @@ typedef struct ct_enum {
 
 "#);
 
-    // Static data for structs
+    // Static data for structs with strict C-string escaping
     s.push_str("static const ct_struct _CT_ALL_STRUCTS[] = {\n");
     for st in structs {
         s.push_str(&format!(
             "    {{\n        .name = \"{}\",\n        .field_count = {},\n        .attr_count = {},\n        .attrs = {{\n",
-            st.name,
+            escape_c(&st.name),
             st.fields.len(),
             st.attrs.len(),
         ));
         for a in &st.attrs {
             s.push_str(&format!(
                 "            {{ .name = \"{}\", .value = \"{}\" }},\n",
-                a.name, a.value
+                escape_c(&a.name),
+                escape_c(&a.value)
             ));
         }
         s.push_str("        },\n        .fields = {\n");
         for f in &st.fields {
             s.push_str(&format!(
                 "            {{\n                .name = \"{}\",\n                .type = \"{}\",\n                .kind = {},\n                .is_pointer = {},\n                .array_len = {},\n                .attr_count = {},\n                .attrs = {{\n",
-                f.name,
-                f.type_name,
+                escape_c(&f.name),
+                escape_c(&f.type_name),
                 f.kind.c_enum_str(),
                 if f.is_pointer { 1 } else { 0 },
                 f.array_len,
@@ -106,7 +122,8 @@ typedef struct ct_enum {
             for a in &f.attrs {
                 s.push_str(&format!(
                     "                    {{ .name = \"{}\", .value = \"{}\" }},\n",
-                    a.name, a.value
+                    escape_c(&a.name),
+                    escape_c(&a.value)
                 ));
             }
             s.push_str("                }\n            },\n");
@@ -119,31 +136,35 @@ typedef struct ct_enum {
         structs.len()
     ));
 
-    // Static data for enums
+    // Static data for enums with strict C-string escaping
     s.push_str("static const ct_enum _CT_ALL_ENUMS[] = {\n");
     for en in enums {
         s.push_str(&format!(
             "    {{\n        .name = \"{}\",\n        .variant_count = {},\n        .attr_count = {},\n        .attrs = {{\n",
-            en.name,
+            escape_c(&en.name),
             en.variants.len(),
             en.attrs.len(),
         ));
         for a in &en.attrs {
             s.push_str(&format!(
                 "            {{ .name = \"{}\", .value = \"{}\" }},\n",
-                a.name, a.value
+                escape_c(&a.name),
+                escape_c(&a.value)
             ));
         }
         s.push_str("        },\n        .variants = {\n");
         for v in &en.variants {
             s.push_str(&format!(
                 "            {{\n                .name = \"{}\",\n                .value = {}LL,\n                .attr_count = {},\n                .attrs = {{\n",
-                v.name, v.value, v.attrs.len()
+                escape_c(&v.name),
+                v.value,
+                v.attrs.len()
             ));
             for a in &v.attrs {
                 s.push_str(&format!(
                     "                    {{ .name = \"{}\", .value = \"{}\" }},\n",
-                    a.name, a.value
+                    escape_c(&a.name),
+                    escape_c(&a.value)
                 ));
             }
             s.push_str("                }\n            },\n");

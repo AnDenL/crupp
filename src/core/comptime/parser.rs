@@ -6,6 +6,15 @@ static RE_STRUCT: OnceLock<Regex> = OnceLock::new();
 static RE_ENUM: OnceLock<Regex> = OnceLock::new();
 static RE_ATTR: OnceLock<Regex> = OnceLock::new();
 
+pub fn is_valid_c_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => (),
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 pub fn extract_attributes(text: &str) -> Vec<CtAttr> {
     let mut attrs = Vec::new();
 
@@ -50,7 +59,7 @@ pub fn parse_c_declarations(content: &str) -> (Vec<CtStruct>, Vec<CtEnum>) {
             .map(|m| m.as_str())
             .unwrap_or("");
 
-        if name.is_empty() || body.is_empty() {
+        if name.is_empty() || body.is_empty() || !is_valid_c_ident(name) {
             continue;
         }
 
@@ -86,7 +95,7 @@ pub fn parse_c_declarations(content: &str) -> (Vec<CtStruct>, Vec<CtEnum>) {
             .map(|m| m.as_str())
             .unwrap_or("");
 
-        if name.is_empty() || body.is_empty() {
+        if name.is_empty() || body.is_empty() || !is_valid_c_ident(name) {
             continue;
         }
 
@@ -177,6 +186,10 @@ fn parse_struct_fields(body: &str) -> Vec<CtField> {
                 var_str = var_str[..open_bracket].trim();
             }
 
+            if !is_valid_c_ident(var_str) {
+                continue;
+            }
+
             let final_type = if is_ptr && !base_type.contains('*') {
                 format!("{}*", base_type)
             } else {
@@ -231,20 +244,24 @@ fn parse_enum_variants(body: &str) -> Vec<CtVariant> {
                     current_val = v;
                 }
             }
-            variants.push(CtVariant {
-                name,
-                value: current_val,
-                attrs,
-            });
-            current_val += 1;
+            if is_valid_c_ident(&name) {
+                variants.push(CtVariant {
+                    name,
+                    value: current_val,
+                    attrs,
+                });
+                current_val += 1;
+            }
         } else {
             let name = clean.split_whitespace().next().unwrap_or(clean).to_string();
-            variants.push(CtVariant {
-                name,
-                value: current_val,
-                attrs,
-            });
-            current_val += 1;
+            if is_valid_c_ident(&name) {
+                variants.push(CtVariant {
+                    name,
+                    value: current_val,
+                    attrs,
+                });
+                current_val += 1;
+            }
         }
     }
 

@@ -29,6 +29,7 @@ pub struct BuildContext {
     pub obj_dir: PathBuf,
     pub pb: ProgressBar,
     pub profile: BuildProfile,
+    pub profile_flags: Vec<String>,
     pub verbose: bool,
     pub force: bool,
 }

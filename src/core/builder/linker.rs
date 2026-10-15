@@ -1,5 +1,5 @@
 use super::diagnostics::{detect_missing_libs_from_stderr, explain_io_error, explain_linker_error};
-use crate::config::{BinTarget, BuildProfile, Language, Package};
+use crate::config::{BinTarget, Language, Package};
 use crate::core::scanner::TranslationUnit;
 use colored::*;
 use petgraph::graph::NodeIndex;
@@ -56,7 +56,7 @@ pub async fn link_targets(
     path_to_node: &HashMap<PathBuf, NodeIndex>,
     obj_files_map: &HashMap<NodeIndex, PathBuf>,
     build_dir: &Path,
-    profile: BuildProfile,
+    profile_flags: &[String],
     verbose: bool,
 ) -> Result<(), String> {
     let has_any_cpp = units.iter().any(|u| u.language == Language::Cpp);
@@ -102,8 +102,10 @@ pub async fn link_targets(
                 cmd.arg(part);
             }
         }
-        for flag in profile.flags() {
-            cmd.arg(flag);
+        for flag in profile_flags {
+            for part in flag.split_whitespace() {
+                cmd.arg(part);
+            }
         }
         for obj in &required_objects {
             cmd.arg(obj);
@@ -150,8 +152,10 @@ pub async fn link_targets(
                         retry_cmd.arg(part);
                     }
                 }
-                for flag in profile.flags() {
-                    retry_cmd.arg(flag);
+                for flag in profile_flags {
+                    for part in flag.split_whitespace() {
+                        retry_cmd.arg(part);
+                    }
                 }
                 for obj in &required_objects {
                     retry_cmd.arg(obj);

@@ -20,32 +20,40 @@ async fn main() {
             target,
             release,
             debug,
+            sanitize,
+            profile,
             force,
         } => {
-            let profile = if *release {
+            let build_profile = if *release {
                 BuildProfile::Release
             } else if *debug {
                 BuildProfile::Debug
+            } else if *sanitize {
+                BuildProfile::Sanitize
+            } else if let Some(p) = profile {
+                BuildProfile::Custom(p.clone())
             } else {
                 BuildProfile::Default
             };
 
-            let profile_str = match profile {
-                BuildProfile::Release => " [release]",
-                BuildProfile::Debug => " [debug]",
-                BuildProfile::Default => "",
+            let profile_str = match &build_profile {
+                BuildProfile::Release => " [release]".bright_magenta(),
+                BuildProfile::Debug => " [debug]".bright_blue(),
+                BuildProfile::Sanitize => " [sanitize]".bright_red(),
+                BuildProfile::Custom(p) => format!(" [{}]", p).bright_yellow(),
+                BuildProfile::Default => "".normal(),
             };
 
             println!(
                 "{}{}",
                 "Building project...".bright_green().bold(),
-                profile_str.bright_magenta()
+                profile_str
             );
 
             let opts = core::builder::BuildOptions {
                 manifest_path: manifest,
                 target_name: target.as_deref(),
-                profile,
+                profile: build_profile,
                 jobs: cli.jobs,
                 verbose,
                 force: *force,
@@ -62,20 +70,56 @@ async fn main() {
             target,
             release,
             debug,
+            sanitize,
+            profile,
             args,
         } => {
-            let profile = if *release {
+            let build_profile = if *release {
                 BuildProfile::Release
             } else if *debug {
                 BuildProfile::Debug
+            } else if *sanitize {
+                BuildProfile::Sanitize
+            } else if let Some(p) = profile {
+                BuildProfile::Custom(p.clone())
             } else {
                 BuildProfile::Default
             };
 
+            // Check if target refers to a standalone C or C++ source file
+            let is_standalone_source = target.as_ref().map_or(false, |t| {
+                let p = Path::new(t);
+                if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
+                    matches!(
+                        ext.to_lowercase().as_str(),
+                        "c" | "cpp" | "cxx" | "cc" | "c++"
+                    )
+                } else {
+                    false
+                }
+            }) || target.as_ref().map_or(false, |t| Path::new(t).is_file());
+
+            if is_standalone_source {
+                let file_path = Path::new(target.as_ref().unwrap());
+                if let Err(e) = core::runner::run_standalone_file(
+                    file_path,
+                    manifest,
+                    build_profile,
+                    args,
+                    verbose,
+                )
+                .await
+                {
+                    eprintln!("\n{} {}", "❌ Run error:".red().bold(), e);
+                    std::process::exit(1);
+                }
+                return;
+            }
+
             let opts = core::builder::BuildOptions {
                 manifest_path: manifest,
                 target_name: target.as_deref(),
-                profile,
+                profile: build_profile,
                 jobs: cli.jobs,
                 verbose,
                 force: false,
@@ -96,6 +140,33 @@ async fn main() {
             .await
             {
                 eprintln!("\n{} {}", "❌ Target error:".red().bold(), e);
+                std::process::exit(1);
+            }
+        }
+
+        Commands::AddBin { name, path, manifest } => {
+            match config::add_bin_to_manifest(manifest, name, path) {
+                Ok(msg) => println!("{:>12} {}", "Success".green().bold(), msg),
+                Err(e) => {
+                    eprintln!("{} {}", "❌ Error:".red().bold(), e);
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        Commands::AddLib { lib, manifest, no_check } => {
+            match config::add_library_to_manifest(manifest, lib, *no_check) {
+                Ok(msg) => println!("{:>12} {}", "Success".green().bold(), msg),
+                Err(e) => {
+                    eprintln!("{} {}", "❌ Error:".red().bold(), e);
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        Commands::CheckLibs { manifest } => {
+            if let Err(e) = config::check_manifest_libraries(manifest) {
+                eprintln!("{} {}", "❌ Error:".red().bold(), e);
                 std::process::exit(1);
             }
         }

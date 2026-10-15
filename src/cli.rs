@@ -36,35 +36,51 @@ pub enum Commands {
         target: Option<String>,
 
         /// Build with optimizations enabled (-O3, -DNDEBUG)
-        #[arg(short = 'r', long = "release", conflicts_with = "debug")]
+        #[arg(short = 'r', long = "release", conflicts_with_all = ["debug", "sanitize"])]
         release: bool,
 
         /// Build with debug symbols and no optimizations (-g, -O0, -DDEBUG)
-        #[arg(short = 'd', long = "debug", conflicts_with = "release")]
+        #[arg(short = 'd', long = "debug", conflicts_with_all = ["release", "sanitize"])]
         debug: bool,
+
+        /// Build with address and undefined behavior sanitizers (-fsanitize=address,undefined -g -O1)
+        #[arg(short = 's', long = "sanitize", conflicts_with_all = ["release", "debug"])]
+        sanitize: bool,
+
+        /// Build using a custom profile defined in Crub.toml ([profile.<name>])
+        #[arg(long = "profile")]
+        profile: Option<String>,
 
         /// Force recompile by invalidating cache
         #[arg(long = "force")]
         force: bool,
     },
 
-    /// Build and run a specific target
+    /// Build and run a target or standalone source file (.c / .cpp)
     Run {
         /// Path to configuration manifest
         #[arg(short, long, default_value = "Crub.toml")]
         manifest: String,
 
-        /// Run a specific target (defaults to first binary)
+        /// Run a specific target (defaults to first binary) or path to single source file (e.g., test.c)
         #[arg(short = 't', long = "target", alias = "bin")]
         target: Option<String>,
 
         /// Build with optimizations enabled
-        #[arg(short = 'r', long = "release", conflicts_with = "debug")]
+        #[arg(short = 'r', long = "release", conflicts_with_all = ["debug", "sanitize"])]
         release: bool,
 
         /// Build with debug symbols
-        #[arg(short = 'd', long = "debug", conflicts_with = "release")]
+        #[arg(short = 'd', long = "debug", conflicts_with_all = ["release", "sanitize"])]
         debug: bool,
+
+        /// Build with address and undefined behavior sanitizers (-fsanitize=address,undefined -g -O1)
+        #[arg(short = 's', long = "sanitize", conflicts_with_all = ["release", "debug"])]
+        sanitize: bool,
+
+        /// Build using a custom profile defined in Crub.toml ([profile.<name>])
+        #[arg(long = "profile")]
+        profile: Option<String>,
 
         /// Arguments passed to the target executable
         #[arg(last = true)]
@@ -113,6 +129,41 @@ pub enum Commands {
         /// Output path for compilation database
         #[arg(short = 'o', long = "output", default_value = "compile_commands.json")]
         output: String,
+    },
+
+    /// Add a binary target [[bin]] to Crub.toml
+    AddBin {
+        /// Binary target name (executable name)
+        name: String,
+
+        /// Source file path containing main() (e.g., src/tools/inspect.c)
+        path: String,
+
+        /// Path to configuration manifest
+        #[arg(short, long, default_value = "Crub.toml")]
+        manifest: String,
+    },
+
+    /// Add a system library dependency to Crub.toml with host verification
+    AddLib {
+        /// Library name or pkg-config name (e.g., glfw, cjson, sqlite3, m, zlib)
+        lib: String,
+
+        /// Path to configuration manifest
+        #[arg(short, long, default_value = "Crub.toml")]
+        manifest: String,
+
+        /// Skip verifying whether the library is installed on the host system
+        #[arg(long = "no-check")]
+        no_check: bool,
+    },
+
+    /// Check system dependencies and libraries listed in Crub.toml
+    #[command(alias = "doctor")]
+    CheckLibs {
+        /// Path to configuration manifest
+        #[arg(short, long, default_value = "Crub.toml")]
+        manifest: String,
     },
 
     /// Generate Crub.toml template
