@@ -43,8 +43,9 @@ impl TypeKind {
     }
 
     pub fn from_c_type(raw_type: &str, is_ptr: bool, is_arr: bool) -> Self {
+        let base_no_ptr = raw_type.trim().trim_end_matches('*').trim();
         if is_ptr {
-            if raw_type == "char" || raw_type == "const char" {
+            if base_no_ptr == "char" || base_no_ptr == "const char" {
                 return TypeKind::String;
             }
             return TypeKind::Pointer;
@@ -53,7 +54,7 @@ impl TypeKind {
             return TypeKind::Array;
         }
 
-        let clean = raw_type.trim();
+        let clean = base_no_ptr.trim_start_matches("const ").trim();
         match clean {
             "int8_t" | "signed char" | "i8" => TypeKind::Int8,
             "uint8_t" | "unsigned char" | "u8" => TypeKind::UInt8,
@@ -61,7 +62,7 @@ impl TypeKind {
             "uint16_t" | "unsigned short" | "u16" => TypeKind::UInt16,
             "int" | "int32_t" | "long" | "signed int" | "i32" => TypeKind::Int32,
             "uint32_t" | "unsigned int" | "unsigned long" | "u32" => TypeKind::UInt32,
-            "int64_t" | "long long" | "i64" | "isize" => TypeKind::Int64,
+            "int64_t" | "long long" | "i64" | "isize" | "ssize_t" => TypeKind::Int64,
             "uint64_t" | "unsigned long long" | "size_t" | "u64" | "usize" => TypeKind::UInt64,
             "float" | "f32" => TypeKind::Float,
             "double" | "f64" => TypeKind::Double,
@@ -80,7 +81,7 @@ impl TypeKind {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CtAttr {
     pub name: String,
     pub value: String,

@@ -1,4 +1,4 @@
-use super::types::{CtEnum, CtStruct};
+use super::types::{CtAttr, CtEnum, CtStruct};
 
 fn escape_c(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 4);
@@ -9,19 +9,31 @@ fn escape_c(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            '\0' => out.push_str("\\0"),
+            c if c.is_control() => out.push_str(&format!("\\x{:02x}", c as u32)),
             _ => out.push(c),
         }
     }
     out
 }
 
-pub fn generate_comptime_header(
-    structs: &[CtStruct],
-    enums: &[CtEnum],
-) -> String {
-    let mut s = String::new();
+fn format_legacy_attr_summary(attrs: &[CtAttr]) -> String {
+    if attrs.is_empty() {
+        return String::new();
+    }
+    let first = &attrs[0];
+    if first.value.is_empty() {
+        escape_c(&first.name)
+    } else {
+        escape_c(&first.value)
+    }
+}
 
-    s.push_str(r#"#ifndef COMPTIME_H
+pub fn generate_comptime_header(structs: &[CtStruct], enums: &[CtEnum]) -> String {
+    let mut s = String::with_capacity(16384);
+
+    s.push_str(
+        r#"#ifndef COMPTIME_H
 #define COMPTIME_H
 
 #include <stdio.h>
@@ -30,6 +42,7 @@ pub fn generate_comptime_header(
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdarg.h>
 #include <ctype.h>
 
 typedef enum {
@@ -63,122 +76,213 @@ typedef struct ct_field {
     TypeKind kind;
     int is_pointer;
     int array_len;
+    const char* attr;
     int attr_count;
-    ct_attr attrs[16];
+    const ct_attr* attrs;
 } ct_field;
 
 typedef struct ct_struct {
     const char* name;
     int field_count;
-    ct_field fields[64];
+    const ct_field* fields;
+    const char* attr;
     int attr_count;
-    ct_attr attrs[32];
+    const ct_attr* attrs;
 } ct_struct;
 
 typedef struct ct_variant {
     const char* name;
     int64_t value;
+    const char* attr;
     int attr_count;
-    ct_attr attrs[16];
+    const ct_attr* attrs;
 } ct_variant;
 
 typedef struct ct_enum {
     const char* name;
     int variant_count;
-    ct_variant variants[128];
+    const ct_variant* variants;
+    const char* attr;
     int attr_count;
-    ct_attr attrs[32];
+    const ct_attr* attrs;
 } ct_enum;
 
-"#);
+"#,
+    );
 
-    // Static data for structs with strict C-string escaping
-    s.push_str("static const ct_struct _CT_ALL_STRUCTS[] = {\n");
-    for st in structs {
-        s.push_str(&format!(
-            "    {{\n        .name = \"{}\",\n        .field_count = {},\n        .attr_count = {},\n        .attrs = {{\n",
-            escape_c(&st.name),
-            st.fields.len(),
-            st.attrs.len(),
-        ));
-        for a in &st.attrs {
-            s.push_str(&format!(
-                "            {{ .name = \"{}\", .value = \"{}\" }},\n",
-                escape_c(&a.name),
-                escape_c(&a.value)
-            ));
-        }
-        s.push_str("        },\n        .fields = {\n");
-        for f in &st.fields {
-            s.push_str(&format!(
-                "            {{\n                .name = \"{}\",\n                .type = \"{}\",\n                .kind = {},\n                .is_pointer = {},\n                .array_len = {},\n                .attr_count = {},\n                .attrs = {{\n",
-                escape_c(&f.name),
-                escape_c(&f.type_name),
-                f.kind.c_enum_str(),
-                if f.is_pointer { 1 } else { 0 },
-                f.array_len,
-                f.attrs.len(),
-            ));
-            for a in &f.attrs {
+    // Emit static sub-arrays for struct and field metadata (unlimited capacity, zero stack/array overflow)
+    for (si, st) in structs.iter().enumerate() {
+        if !st.attrs.is_empty() {
+            s.push_str(&format!("static const ct_attr _ct_s{}_attrs[] = {{\n", si));
+            for a in &st.attrs {
                 s.push_str(&format!(
-                    "                    {{ .name = \"{}\", .value = \"{}\" }},\n",
+                    "    {{ .name = \"{}\", .value = \"{}\" }},\n",
                     escape_c(&a.name),
                     escape_c(&a.value)
                 ));
             }
-            s.push_str("                }\n            },\n");
+            s.push_str("};\n");
         }
-        s.push_str("        }\n    },\n");
+
+        for (fi, f) in st.fields.iter().enumerate() {
+            if !f.attrs.is_empty() {
+                s.push_str(&format!(
+                    "static const ct_attr _ct_s{}_f{}_attrs[] = {{\n",
+                    si, fi
+                ));
+                for a in &f.attrs {
+                    s.push_str(&format!(
+                        "    {{ .name = \"{}\", .value = \"{}\" }},\n",
+                        escape_c(&a.name),
+                        escape_c(&a.value)
+                    ));
+                }
+                s.push_str("};\n");
+            }
+        }
+
+        if !st.fields.is_empty() {
+            s.push_str(&format!(
+                "static const ct_field _ct_s{}_fields[] = {{\n",
+                si
+            ));
+            for (fi, f) in st.fields.iter().enumerate() {
+                let f_attrs_ptr = if f.attrs.is_empty() {
+                    "NULL".to_string()
+                } else {
+                    format!("_ct_s{}_f{}_attrs", si, fi)
+                };
+                s.push_str(&format!(
+                    "    {{ .name = \"{}\", .type = \"{}\", .kind = {}, .is_pointer = {}, .array_len = {}, .attr = \"{}\", .attr_count = {}, .attrs = {} }},\n",
+                    escape_c(&f.name),
+                    escape_c(&f.type_name),
+                    f.kind.c_enum_str(),
+                    if f.is_pointer { 1 } else { 0 },
+                    f.array_len,
+                    format_legacy_attr_summary(&f.attrs),
+                    f.attrs.len(),
+                    f_attrs_ptr,
+                ));
+            }
+            s.push_str("};\n");
+        }
     }
-    s.push_str("};\n");
+
+    s.push_str("\nstatic const ct_struct _CT_ALL_STRUCTS[] = {\n");
+    for (si, st) in structs.iter().enumerate() {
+        let fields_ptr = if st.fields.is_empty() {
+            "NULL".to_string()
+        } else {
+            format!("_ct_s{}_fields", si)
+        };
+        let attrs_ptr = if st.attrs.is_empty() {
+            "NULL".to_string()
+        } else {
+            format!("_ct_s{}_attrs", si)
+        };
+        s.push_str(&format!(
+            "    {{ .name = \"{}\", .field_count = {}, .fields = {}, .attr = \"{}\", .attr_count = {}, .attrs = {} }},\n",
+            escape_c(&st.name),
+            st.fields.len(),
+            fields_ptr,
+            format_legacy_attr_summary(&st.attrs),
+            st.attrs.len(),
+            attrs_ptr,
+        ));
+    }
+    // Always include a sentinel element so _CT_ALL_STRUCTS is never a zero-length C array
+    s.push_str("    { .name = NULL, .field_count = 0, .fields = NULL, .attr = \"\", .attr_count = 0, .attrs = NULL }\n};\n");
     s.push_str(&format!(
         "static const int _CT_STRUCT_COUNT = {};\n\n",
         structs.len()
     ));
 
-    // Static data for enums with strict C-string escaping
-    s.push_str("static const ct_enum _CT_ALL_ENUMS[] = {\n");
-    for en in enums {
-        s.push_str(&format!(
-            "    {{\n        .name = \"{}\",\n        .variant_count = {},\n        .attr_count = {},\n        .attrs = {{\n",
-            escape_c(&en.name),
-            en.variants.len(),
-            en.attrs.len(),
-        ));
-        for a in &en.attrs {
-            s.push_str(&format!(
-                "            {{ .name = \"{}\", .value = \"{}\" }},\n",
-                escape_c(&a.name),
-                escape_c(&a.value)
-            ));
-        }
-        s.push_str("        },\n        .variants = {\n");
-        for v in &en.variants {
-            s.push_str(&format!(
-                "            {{\n                .name = \"{}\",\n                .value = {}LL,\n                .attr_count = {},\n                .attrs = {{\n",
-                escape_c(&v.name),
-                v.value,
-                v.attrs.len()
-            ));
-            for a in &v.attrs {
+    // Emit static sub-arrays for enum and variant metadata
+    for (ei, en) in enums.iter().enumerate() {
+        if !en.attrs.is_empty() {
+            s.push_str(&format!("static const ct_attr _ct_e{}_attrs[] = {{\n", ei));
+            for a in &en.attrs {
                 s.push_str(&format!(
-                    "                    {{ .name = \"{}\", .value = \"{}\" }},\n",
+                    "    {{ .name = \"{}\", .value = \"{}\" }},\n",
                     escape_c(&a.name),
                     escape_c(&a.value)
                 ));
             }
-            s.push_str("                }\n            },\n");
+            s.push_str("};\n");
         }
-        s.push_str("        }\n    },\n");
+
+        for (vi, v) in en.variants.iter().enumerate() {
+            if !v.attrs.is_empty() {
+                s.push_str(&format!(
+                    "static const ct_attr _ct_e{}_v{}_attrs[] = {{\n",
+                    ei, vi
+                ));
+                for a in &v.attrs {
+                    s.push_str(&format!(
+                        "    {{ .name = \"{}\", .value = \"{}\" }},\n",
+                        escape_c(&a.name),
+                        escape_c(&a.value)
+                    ));
+                }
+                s.push_str("};\n");
+            }
+        }
+
+        if !en.variants.is_empty() {
+            s.push_str(&format!(
+                "static const ct_variant _ct_e{}_variants[] = {{\n",
+                ei
+            ));
+            for (vi, v) in en.variants.iter().enumerate() {
+                let v_attrs_ptr = if v.attrs.is_empty() {
+                    "NULL".to_string()
+                } else {
+                    format!("_ct_e{}_v{}_attrs", ei, vi)
+                };
+                s.push_str(&format!(
+                    "    {{ .name = \"{}\", .value = {}LL, .attr = \"{}\", .attr_count = {}, .attrs = {} }},\n",
+                    escape_c(&v.name),
+                    v.value,
+                    format_legacy_attr_summary(&v.attrs),
+                    v.attrs.len(),
+                    v_attrs_ptr,
+                ));
+            }
+            s.push_str("};\n");
+        }
     }
-    s.push_str("};\n");
+
+    s.push_str("\nstatic const ct_enum _CT_ALL_ENUMS[] = {\n");
+    for (ei, en) in enums.iter().enumerate() {
+        let variants_ptr = if en.variants.is_empty() {
+            "NULL".to_string()
+        } else {
+            format!("_ct_e{}_variants", ei)
+        };
+        let attrs_ptr = if en.attrs.is_empty() {
+            "NULL".to_string()
+        } else {
+            format!("_ct_e{}_attrs", ei)
+        };
+        s.push_str(&format!(
+            "    {{ .name = \"{}\", .variant_count = {}, .variants = {}, .attr = \"{}\", .attr_count = {}, .attrs = {} }},\n",
+            escape_c(&en.name),
+            en.variants.len(),
+            variants_ptr,
+            format_legacy_attr_summary(&en.attrs),
+            en.attrs.len(),
+            attrs_ptr,
+        ));
+    }
+    s.push_str("    { .name = NULL, .variant_count = 0, .variants = NULL, .attr = \"\", .attr_count = 0, .attrs = NULL }\n};\n");
     s.push_str(&format!(
         "static const int _CT_ENUM_COUNT = {};\n\n",
         enums.len()
     ));
 
     // Functions and Macros
-    s.push_str(r#"
+    s.push_str(
+        r#"
 // ============================================================================
 // Direct Array Access & Query API
 // ============================================================================
@@ -197,7 +301,7 @@ static inline const ct_struct* get_struct(int index) {
 static inline const ct_struct* find_struct(const char* name) {
     if (!name) return NULL;
     for (int i = 0; i < _CT_STRUCT_COUNT; i++) {
-        if (strcmp(_CT_ALL_STRUCTS[i].name, name) == 0) {
+        if (_CT_ALL_STRUCTS[i].name && strcmp(_CT_ALL_STRUCTS[i].name, name) == 0) {
             return &_CT_ALL_STRUCTS[i];
         }
     }
@@ -205,9 +309,9 @@ static inline const ct_struct* find_struct(const char* name) {
 }
 
 static inline const ct_field* find_field(const ct_struct* s, const char* name) {
-    if (!s || !name) return NULL;
+    if (!s || !s->fields || !name) return NULL;
     for (int i = 0; i < s->field_count; i++) {
-        if (strcmp(s->fields[i].name, name) == 0) {
+        if (s->fields[i].name && strcmp(s->fields[i].name, name) == 0) {
             return &s->fields[i];
         }
     }
@@ -228,7 +332,7 @@ static inline const ct_enum* get_enum(int index) {
 static inline const ct_enum* find_enum(const char* name) {
     if (!name) return NULL;
     for (int i = 0; i < _CT_ENUM_COUNT; i++) {
-        if (strcmp(_CT_ALL_ENUMS[i].name, name) == 0) {
+        if (_CT_ALL_ENUMS[i].name && strcmp(_CT_ALL_ENUMS[i].name, name) == 0) {
             return &_CT_ALL_ENUMS[i];
         }
     }
@@ -236,9 +340,9 @@ static inline const ct_enum* find_enum(const char* name) {
 }
 
 static inline const ct_variant* find_variant(const ct_enum* e, const char* name) {
-    if (!e || !name) return NULL;
+    if (!e || !e->variants || !name) return NULL;
     for (int i = 0; i < e->variant_count; i++) {
-        if (strcmp(e->variants[i].name, name) == 0) {
+        if (e->variants[i].name && strcmp(e->variants[i].name, name) == 0) {
             return &e->variants[i];
         }
     }
@@ -246,21 +350,21 @@ static inline const ct_variant* find_variant(const ct_enum* e, const char* name)
 }
 
 // ============================================================================
-// Attribute Inspection Helpers
+// NULL-Safe Attribute Inspection Helpers
 // ============================================================================
 
 static inline bool ct_has_attr(int count, const ct_attr* attrs, const char* name) {
-    if (!attrs || !name) return false;
+    if (!attrs || !name || count <= 0) return false;
     for (int i = 0; i < count; i++) {
-        if (strcmp(attrs[i].name, name) == 0) return true;
+        if (attrs[i].name && strcmp(attrs[i].name, name) == 0) return true;
     }
     return false;
 }
 
 static inline const char* ct_get_attr(int count, const ct_attr* attrs, const char* name) {
-    if (!attrs || !name) return NULL;
+    if (!attrs || !name || count <= 0) return NULL;
     for (int i = 0; i < count; i++) {
-        if (strcmp(attrs[i].name, name) == 0) return attrs[i].value;
+        if (attrs[i].name && strcmp(attrs[i].name, name) == 0) return attrs[i].value;
     }
     return NULL;
 }
@@ -270,19 +374,53 @@ static inline const char* ct_attr_or(int count, const ct_attr* attrs, const char
     return (val && val[0] != '\0') ? val : fallback;
 }
 
-#define struct_has_attr(s, name)          ct_has_attr((s)->attr_count, (s)->attrs, name)
-#define struct_get_attr(s, name)          ct_get_attr((s)->attr_count, (s)->attrs, name)
-#define struct_attr_or(s, name, fallback) ct_attr_or((s)->attr_count, (s)->attrs, name, fallback)
+static inline bool struct_has_attr(const ct_struct* s, const char* name) {
+    return s ? ct_has_attr(s->attr_count, s->attrs, name) : false;
+}
 
-#define field_has_attr(f, name)           ct_has_attr((f)->attr_count, (f)->attrs, name)
-#define field_get_attr(f, name)           ct_get_attr((f)->attr_count, (f)->attrs, name)
-#define field_attr_or(f, name, fallback)  ct_attr_or((f)->attr_count, (f)->attrs, name, fallback)
+static inline const char* struct_get_attr(const ct_struct* s, const char* name) {
+    return s ? ct_get_attr(s->attr_count, s->attrs, name) : NULL;
+}
 
-#define enum_has_attr(e, name)            ct_has_attr((e)->attr_count, (e)->attrs, name)
-#define enum_get_attr(e, name)            ct_get_attr((e)->attr_count, (e)->attrs, name)
+static inline const char* struct_attr_or(const ct_struct* s, const char* name, const char* fallback) {
+    return s ? ct_attr_or(s->attr_count, s->attrs, name, fallback) : fallback;
+}
 
-#define variant_has_attr(v, name)         ct_has_attr((v)->attr_count, (v)->attrs, name)
-#define variant_get_attr(v, name)         ct_get_attr((v)->attr_count, (v)->attrs, name)
+static inline bool field_has_attr(const ct_field* f, const char* name) {
+    return f ? ct_has_attr(f->attr_count, f->attrs, name) : false;
+}
+
+static inline const char* field_get_attr(const ct_field* f, const char* name) {
+    return f ? ct_get_attr(f->attr_count, f->attrs, name) : NULL;
+}
+
+static inline const char* field_attr_or(const ct_field* f, const char* name, const char* fallback) {
+    return f ? ct_attr_or(f->attr_count, f->attrs, name, fallback) : fallback;
+}
+
+static inline bool enum_has_attr(const ct_enum* e, const char* name) {
+    return e ? ct_has_attr(e->attr_count, e->attrs, name) : false;
+}
+
+static inline const char* enum_get_attr(const ct_enum* e, const char* name) {
+    return e ? ct_get_attr(e->attr_count, e->attrs, name) : NULL;
+}
+
+static inline const char* enum_attr_or(const ct_enum* e, const char* name, const char* fallback) {
+    return e ? ct_attr_or(e->attr_count, e->attrs, name, fallback) : fallback;
+}
+
+static inline bool variant_has_attr(const ct_variant* v, const char* name) {
+    return v ? ct_has_attr(v->attr_count, v->attrs, name) : false;
+}
+
+static inline const char* variant_get_attr(const ct_variant* v, const char* name) {
+    return v ? ct_get_attr(v->attr_count, v->attrs, name) : NULL;
+}
+
+static inline const char* variant_attr_or(const ct_variant* v, const char* name, const char* fallback) {
+    return v ? ct_attr_or(v->attr_count, v->attrs, name, fallback) : fallback;
+}
 
 // ============================================================================
 // String Utilities (Case Conversion & Formatting for C Codegen)
@@ -348,22 +486,79 @@ static inline bool str_ends_with(const char* str, const char* suffix) {
 }
 
 // ============================================================================
-// Code Emission & Template Helpers
+// Dedicated In-Memory Code Emission Buffer (Thread-Safe, Zero-Stdout-Hijack)
 // ============================================================================
 
-static inline void emit(const char* str) {
-    if (str) fputs(str, stdout);
+static char* _ct_emit_buf = NULL;
+static size_t _ct_emit_len = 0;
+static size_t _ct_emit_cap = 0;
+
+static inline void _ct_append_bytes(const char* data, size_t len) {
+    if (!data || len == 0) return;
+    if (_ct_emit_len + len + 1 > _ct_emit_cap) {
+        size_t new_cap = _ct_emit_cap == 0 ? 8192 : _ct_emit_cap * 2;
+        while (new_cap < _ct_emit_len + len + 1) {
+            new_cap *= 2;
+        }
+        char* grown = (char*)realloc(_ct_emit_buf, new_cap);
+        if (!grown) return;
+        _ct_emit_buf = grown;
+        _ct_emit_cap = new_cap;
+    }
+    memcpy(_ct_emit_buf + _ct_emit_len, data, len);
+    _ct_emit_len += len;
+    _ct_emit_buf[_ct_emit_len] = '\0';
 }
 
-#define emitf(fmt, ...) printf(fmt, ##__VA_ARGS__)
+static inline void emit(const char* str) {
+    if (str) {
+        _ct_append_bytes(str, strlen(str));
+    }
+}
+
+static inline void emitf(const char* fmt, ...) {
+    if (!fmt) return;
+    char stack_buf[4096];
+    va_list args;
+    va_start(args, fmt);
+    int n = vsnprintf(stack_buf, sizeof(stack_buf), fmt, args);
+    va_end(args);
+    if (n <= 0) return;
+    if ((size_t)n < sizeof(stack_buf)) {
+        _ct_append_bytes(stack_buf, (size_t)n);
+    } else {
+        char* heap_buf = (char*)malloc((size_t)n + 1);
+        if (heap_buf) {
+            va_start(args, fmt);
+            vsnprintf(heap_buf, (size_t)n + 1, fmt, args);
+            va_end(args);
+            _ct_append_bytes(heap_buf, (size_t)n);
+            free(heap_buf);
+        }
+    }
+}
 
 static inline void emit_file(const char* path, const char* content) {
+    if (!path || !content) return;
     FILE* f = fopen(path, "w");
     if (f) {
         fputs(content, f);
         fclose(f);
     } else {
         fprintf(stderr, "Comptime error: cannot write to '%s'\n", path);
+    }
+}
+
+const char* __crupp_get_emitted_code(void) {
+    return _ct_emit_buf ? _ct_emit_buf : "";
+}
+
+void __crupp_free_emitted_code(void) {
+    if (_ct_emit_buf) {
+        free(_ct_emit_buf);
+        _ct_emit_buf = NULL;
+        _ct_emit_len = 0;
+        _ct_emit_cap = 0;
     }
 }
 
@@ -376,7 +571,7 @@ static inline void emit_file(const char* path, const char* content) {
         for (const ct_struct* var = get_struct(_i); var; var = NULL)
 
 #define for_each_field(st, var) \
-    for (int _f = 0; _f < (st)->field_count; _f++) \
+    for (int _f = 0; (st) && _f < (st)->field_count; _f++) \
         for (const ct_field* var = &(st)->fields[_f]; var; var = NULL)
 
 #define for_each_enum(var) \
@@ -384,11 +579,12 @@ static inline void emit_file(const char* path, const char* content) {
         for (const ct_enum* var = get_enum(_i); var; var = NULL)
 
 #define for_each_variant(en, var) \
-    for (int _v = 0; _v < (en)->variant_count; _v++) \
+    for (int _v = 0; (en) && _v < (en)->variant_count; _v++) \
         for (const ct_variant* var = &(en)->variants[_v]; var; var = NULL)
 
 #endif /* COMPTIME_H */
-"#);
+"#,
+    );
 
     s
 }

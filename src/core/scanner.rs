@@ -192,17 +192,34 @@ fn resolve_include_path(
     current_file: &Path,
     include_dirs: &[String],
 ) -> Option<PathBuf> {
-    // 1. Check relative to current file
-    if let Some(parent) = current_file.parent() {
+    // 1. Check relative to current file and its parent directories
+    let mut anc = current_file.parent();
+    while let Some(parent) = anc {
         let candidate = parent.join(inc);
+        if candidate.is_file() {
+            return fs::canonicalize(&candidate).ok().or(Some(candidate));
+        }
+        if parent == Path::new("") || parent == Path::new(".") {
+            break;
+        }
+        anc = parent.parent();
+    }
+
+    // 2. Check standard project directories (., include/, src/)
+    for base in &[".", "include", "src"] {
+        let candidate = Path::new(base).join(inc);
         if candidate.is_file() {
             return fs::canonicalize(&candidate).ok().or(Some(candidate));
         }
     }
 
-    // 2. Check each configured include directory
+    // 3. Check each configured include directory
     for dir in include_dirs {
-        let candidate = Path::new(dir).join(inc);
+        let clean = dir.trim().trim_start_matches("-I").trim();
+        if clean.is_empty() {
+            continue;
+        }
+        let candidate = Path::new(clean).join(inc);
         if candidate.is_file() {
             return fs::canonicalize(&candidate).ok().or(Some(candidate));
         }
@@ -242,6 +259,7 @@ fn compute_base_hash(
     headers_hash: &str,
 ) -> String {
     let mut hasher = Sha256::new();
+    hasher.update(b"crupp-cache-v5");
     hasher.update(content.as_bytes());
     hasher.update(headers_hash.as_bytes());
 
@@ -333,7 +351,7 @@ pub fn scan_file(path: &Path, config: &Package) -> Option<TranslationUnit> {
 
 pub fn discover_sources(source_dir: &str, config: &Package) -> Vec<TranslationUnit> {
     let root_path = Path::new(source_dir);
-    let is_root_scan = root_path == Path::new(".") || root_path == Path::new("./");
+    let is_tests_dir = root_path.file_name().map_or(false, |n| n == "tests");
     let search_dir = if root_path.exists() {
         root_path
     } else if Path::new("src").exists() {
@@ -362,7 +380,7 @@ pub fn discover_sources(source_dir: &str, config: &Package) -> Vec<TranslationUn
             if name == out_dir_name.as_str() || name == "target" {
                 return false;
             }
-            if is_root_scan
+            if !is_tests_dir
                 && (name == "tests"
                     || name == "fuzzing"
                     || name == "examples"

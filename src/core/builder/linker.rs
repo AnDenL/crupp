@@ -77,6 +77,8 @@ pub async fn link_targets(
         .map(|(i, _)| node_indices[i])
         .collect();
 
+    let nix_link_flags = crate::core::nix::extra_linker_flags(&pkg.lib_dirs, &pkg.libs);
+
     for bin in targets_to_link {
         let clean_path = bin.path.trim_start_matches("./").trim_start_matches('/');
         let target_path = PathBuf::from(clean_path);
@@ -112,11 +114,8 @@ pub async fn link_targets(
         }
         cmd.arg("-o").arg(&out_path);
 
-        for lib_dir in &pkg.lib_dirs {
-            let clean = lib_dir.trim().trim_start_matches("-L").trim();
-            if !clean.is_empty() {
-                cmd.arg(format!("-L{}", clean));
-            }
+        for flag in &nix_link_flags {
+            cmd.arg(flag);
         }
 
         let mut effective_libs = pkg.libs.clone();
@@ -126,7 +125,10 @@ pub async fn link_targets(
         for lib in &effective_libs {
             let clean = lib.trim().trim_start_matches("-l").trim();
             if !clean.is_empty() {
-                cmd.arg(format!("-l{}", clean));
+                let l_flag = format!("-l{}", clean);
+                if !nix_link_flags.contains(&l_flag) {
+                    cmd.arg(l_flag);
+                }
             }
         }
 
@@ -162,16 +164,16 @@ pub async fn link_targets(
                 }
                 retry_cmd.arg("-o").arg(&out_path);
 
-                for lib_dir in &pkg.lib_dirs {
-                    let clean = lib_dir.trim().trim_start_matches("-L").trim();
-                    if !clean.is_empty() {
-                        retry_cmd.arg(format!("-L{}", clean));
-                    }
+                for flag in &nix_link_flags {
+                    retry_cmd.arg(flag);
                 }
                 for lib in &effective_libs {
                     let clean = lib.trim().trim_start_matches("-l").trim();
                     if !clean.is_empty() {
-                        retry_cmd.arg(format!("-l{}", clean));
+                        let l_flag = format!("-l{}", clean);
+                        if !nix_link_flags.contains(&l_flag) {
+                            retry_cmd.arg(l_flag);
+                        }
                     }
                 }
                 for missing in &missing_libs {

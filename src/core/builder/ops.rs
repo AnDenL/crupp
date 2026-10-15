@@ -12,6 +12,8 @@ pub async fn check_project(
     _target_name: Option<&str>,
     verbose: bool,
 ) -> Result<(), String> {
+    crate::core::nix::activate_nix_env_if_available();
+
     let (mut manifest, _) = load_manifest_or_autodetect(manifest_path)?;
     let pkg = &mut manifest.package;
 
@@ -30,6 +32,8 @@ pub async fn check_project(
         "{}",
         "Checking syntax across translation units...".bright_cyan()
     );
+
+    let nix_cflags = crate::core::nix::extra_compiler_flags(&pkg.libs);
 
     for unit in &units {
         let (compiler_bin, standard, lang_flags) = match unit.language {
@@ -56,6 +60,9 @@ pub async fn check_project(
             for part in flag.split_whitespace() {
                 cmd.arg(part);
             }
+        }
+        for flag in &nix_cflags {
+            cmd.arg(flag);
         }
 
         let mut seen_includes = HashSet::new();

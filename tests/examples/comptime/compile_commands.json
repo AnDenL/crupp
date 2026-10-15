@@ -1,8 +1,8 @@
 [
   {
-    "directory": "/home/den/Documents/GitHub/crub-graper/tests/examples/comptime",
+    "directory": "/home/andenl/Documents/GitHub/crub-graper/tests/examples/comptime",
     "arguments": [
-      "clang",
+      "gcc",
       "-std=c17",
       "-c",
       "-DCOMPTIME=0",
@@ -10,13 +10,13 @@
       "-Dtcc(x)=(x)",
       "-Wall",
       "-Wextra",
-      "-I/home/den/Documents/GitHub/crub-graper/tests/examples/comptime/.",
-      "-I/home/den/Documents/GitHub/crub-graper/tests/examples/comptime/src",
-      "/home/den/Documents/GitHub/crub-graper/tests/examples/comptime/src/main.c",
+      "-I/home/andenl/Documents/GitHub/crub-graper/tests/examples/comptime/.",
+      "-I/home/andenl/Documents/GitHub/crub-graper/tests/examples/comptime/src",
+      "/home/andenl/Documents/GitHub/crub-graper/tests/examples/comptime/src/main.c",
       "-o",
-      "/home/den/Documents/GitHub/crub-graper/tests/examples/comptime/./build/obj/src_main_c_cb693c64.o"
+      "/home/andenl/Documents/GitHub/crub-graper/tests/examples/comptime/./build/obj/src_main_c_337ddeba.o"
     ],
-    "file": "/home/den/Documents/GitHub/crub-graper/tests/examples/comptime/src/main.c",
-    "output": "/home/den/Documents/GitHub/crub-graper/tests/examples/comptime/./build/obj/src_main_c_cb693c64.o"
+    "file": "/home/andenl/Documents/GitHub/crub-graper/tests/examples/comptime/src/main.c",
+    "output": "/home/andenl/Documents/GitHub/crub-graper/tests/examples/comptime/./build/obj/src_main_c_337ddeba.o"
   }
 ]

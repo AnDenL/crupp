@@ -3,8 +3,8 @@ use clap::{Parser, Subcommand};
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "crupp",
-    version = "0.4.0",
-    about = "🚀 A lightning-fast, zero-config Cargo-like build system for C and C++ (with C++20 modules, comptime, and auto-detection)"
+    version = "0.4.1",
+    about = "🚀 A lightning-fast, zero-config Cargo-like build system for C and C++ (with C++20 modules, comptime, and NixOS integration)"
 )]
 pub struct Cli {
     /// Verbose output (shows full compiler invocations, timings, and diagnostics)
@@ -120,7 +120,7 @@ pub enum Commands {
         all: bool,
     },
 
-    /// Generate compile_commands.json for VS Code / clangd / Neovim / CLion
+    /// Generate compile_commands.json for VS Code / clangd / Neovim / CLion (with NixOS -isystem support)
     Compdb {
         /// Path to configuration manifest
         #[arg(short, long, default_value = "Crub.toml")]
@@ -129,6 +129,22 @@ pub enum Commands {
         /// Output path for compilation database
         #[arg(short = 'o', long = "output", default_value = "compile_commands.json")]
         output: String,
+    },
+
+    /// Generate NixOS environment files (shell.nix, flake.nix, .envrc) from Crub.toml
+    #[command(alias = "shell")]
+    Nix {
+        /// Path to configuration manifest
+        #[arg(short, long, default_value = "Crub.toml")]
+        manifest: String,
+
+        /// Also generate flake.nix for Nix Flakes (`nix develop`)
+        #[arg(long = "flake")]
+        flake: bool,
+
+        /// Also generate .envrc for direnv
+        #[arg(long = "envrc")]
+        envrc: bool,
     },
 
     /// Add a binary target [[bin]] to Crub.toml
@@ -186,6 +202,10 @@ pub enum Commands {
         /// Language template (c or cpp)
         #[arg(long, default_value = "cpp")]
         lang: String,
+
+        /// Also generate shell.nix for NixOS
+        #[arg(long = "nix")]
+        nix: bool,
     },
 
     /// Create a new project directory with template files
@@ -196,5 +216,9 @@ pub enum Commands {
         /// Language template (c or cpp)
         #[arg(long, default_value = "cpp")]
         lang: String,
+
+        /// Also generate shell.nix for NixOS
+        #[arg(long = "nix")]
+        nix: bool,
     },
 }

@@ -1,7 +1,8 @@
 // Integration tests for Crupp build tool
 // Test suite covering multi-binary projects, root source_dir ("./"),
 // vendor source deduplication, comptime metaprogramming, standalone execution,
-// manifest commands (add-bin, add-lib, check-libs), and build profiles.
+// manifest commands (add-bin, add-lib, check-libs), build profiles,
+// and NixOS integration (compdb -isystem discovery, shell.nix/flake.nix generation, NIX_CFLAGS_COMPILE).
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -96,6 +97,7 @@ fn test_multi_binary_root_source_dir() {
 
     let mut cmd = Command::cargo_bin("crupp").unwrap();
     cmd.current_dir(root)
+        .env("CRUPP_NO_AUTO_NIX_SHELL", "1")
         .arg("build")
         .assert()
         .success()
@@ -169,6 +171,7 @@ fn test_vendor_source_deduplication() {
     // Build must succeed with NO duplicate symbol definitions
     let mut cmd = Command::cargo_bin("crupp").unwrap();
     cmd.current_dir(root)
+        .env("CRUPP_NO_AUTO_NIX_SHELL", "1")
         .arg("build")
         .assert()
         .success()
@@ -177,6 +180,7 @@ fn test_vendor_source_deduplication() {
     let mut run_cmd = Command::cargo_bin("crupp").unwrap();
     run_cmd
         .current_dir(root)
+        .env("CRUPP_NO_AUTO_NIX_SHELL", "1")
         .arg("run")
         .assert()
         .success()
@@ -250,6 +254,7 @@ fn test_comptime_reflection_and_generation() {
 
     let mut cmd = Command::cargo_bin("crupp").unwrap();
     cmd.current_dir(root)
+        .env("CRUPP_NO_AUTO_NIX_SHELL", "1")
         .arg("run")
         .assert()
         .success()
@@ -341,6 +346,7 @@ fn test_comptime_multi_file_headers() {
 
     let mut cmd = Command::cargo_bin("crupp").unwrap();
     cmd.current_dir(root)
+        .env("CRUPP_NO_AUTO_NIX_SHELL", "1")
         .arg("run")
         .assert()
         .success()
@@ -368,6 +374,7 @@ fn test_standalone_single_file_run() {
 
     let mut cmd = Command::cargo_bin("crupp").unwrap();
     cmd.current_dir(root)
+        .env("CRUPP_NO_AUTO_NIX_SHELL", "1")
         .arg("run")
         .arg("scratchpad.c")
         .arg("--")
@@ -422,6 +429,7 @@ fn test_manifest_management_add_bin_and_lib() {
     let mut add_bin_cmd = Command::cargo_bin("crupp").unwrap();
     add_bin_cmd
         .current_dir(root)
+        .env("CRUPP_NO_AUTO_NIX_SHELL", "1")
         .arg("add-bin")
         .arg("inspector")
         .arg("tools/inspector.c")
@@ -433,6 +441,7 @@ fn test_manifest_management_add_bin_and_lib() {
     let mut add_lib_cmd = Command::cargo_bin("crupp").unwrap();
     add_lib_cmd
         .current_dir(root)
+        .env("CRUPP_NO_AUTO_NIX_SHELL", "1")
         .arg("add-lib")
         .arg("m")
         .assert()
@@ -443,6 +452,7 @@ fn test_manifest_management_add_bin_and_lib() {
     let mut check_libs_cmd = Command::cargo_bin("crupp").unwrap();
     check_libs_cmd
         .current_dir(root)
+        .env("CRUPP_NO_AUTO_NIX_SHELL", "1")
         .arg("check-libs")
         .assert()
         .success()
@@ -452,6 +462,7 @@ fn test_manifest_management_add_bin_and_lib() {
     let mut build_cmd = Command::cargo_bin("crupp").unwrap();
     build_cmd
         .current_dir(root)
+        .env("CRUPP_NO_AUTO_NIX_SHELL", "1")
         .arg("build")
         .arg("--bin")
         .arg("inspector")
@@ -463,6 +474,7 @@ fn test_manifest_management_add_bin_and_lib() {
     let mut run_cmd = Command::cargo_bin("crupp").unwrap();
     run_cmd
         .current_dir(root)
+        .env("CRUPP_NO_AUTO_NIX_SHELL", "1")
         .arg("run")
         .arg("--bin")
         .arg("inspector")
@@ -516,6 +528,7 @@ fn test_compilation_profiles_and_custom_flags() {
     let mut rel_cmd = Command::cargo_bin("crupp").unwrap();
     rel_cmd
         .current_dir(root)
+        .env("CRUPP_NO_AUTO_NIX_SHELL", "1")
         .arg("run")
         .arg("--release")
         .assert()
@@ -526,10 +539,249 @@ fn test_compilation_profiles_and_custom_flags() {
     let mut custom_cmd = Command::cargo_bin("crupp").unwrap();
     custom_cmd
         .current_dir(root)
+        .env("CRUPP_NO_AUTO_NIX_SHELL", "1")
         .arg("run")
         .arg("--profile")
         .arg("fast")
         .assert()
         .success()
         .stdout(predicate::str::contains("CUSTOM_PROFILE_OK"));
+}
+
+#[test]
+fn test_scene_comptime_with_comments_and_parallel_units() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join("include")).unwrap();
+    fs::create_dir_all(root.join("src/core/scene")).unwrap();
+    fs::create_dir_all(root.join("game")).unwrap();
+
+    fs::write(
+        root.join("include/en_components.h"),
+        r#"
+        #pragma once
+        typedef float f32;
+        typedef int i32;
+
+        // How this works:
+        // All structs marked with `@component` are reflected.
+
+        typedef struct {
+            int unused_internal;
+        } EnInternalHelper;
+
+        // @component @table("camera")
+        typedef struct {
+            f32 x, y;
+            // @default(64.0f)
+            f32 zoom;
+        } EnCamera2D;
+
+        // @component @table("transform")
+        typedef struct {
+            f32 x, y;
+            f32 rotation;
+            f32 scale_x; // @default(1.0f)
+            f32 scale_y; // @default(1.0f)
+        } EnTransform2D;
+        "#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("src/core/scene/scene.c"),
+        r#"
+        #include "en_components.h"
+        #include <stdio.h>
+
+        // ============================================================================
+        // COMPTIME GENERATOR BLOCK
+        // ============================================================================
+        // How this works:
+        // 1. Crupp extracts metadata from all structs marked with `@component`.
+        // 2. TCC executes this block in RAM during compilation.
+        // 3. `emit()` and `emitf()` replace this entire `#if comptime ... #endif` block
+        //    with optimized, zero-overhead C code.
+        // ============================================================================
+        #if comptime
+        #include <comptime.h>
+
+        int main(void) {
+            int total = struct_count();
+            printf("Comptime debug: scanning %d structs\n", total);
+
+            emit("void populate_scene_bundles(int* out_count) {\n");
+            emit("    int c = 0;\n");
+            for (int i = 0; i < total; i++) {
+                const ct_struct* s = get_struct(i);
+                if (!struct_has_attr(s, "component")) continue;
+                emitf("    c++; // %s\n", s->name);
+            }
+            emit("    *out_count = c;\n");
+            emit("}\n");
+            return 0;
+        }
+        #endif
+
+        int run_scene_loader(void) {
+            int count = 0;
+            populate_scene_bundles(&count);
+            return count;
+        }
+        "#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("game/main.c"),
+        r#"
+        #include <stdio.h>
+        int run_scene_loader(void);
+
+        #if comptime
+        #include <comptime.h>
+        int main(void) {
+            emit("int get_magic(void) { return 77; }\n");
+            return 0;
+        }
+        #endif
+
+        int main(void) {
+            printf("SCENE_COMPONENTS: %d, MAGIC: %d\n", run_scene_loader(), get_magic());
+            return 0;
+        }
+        "#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("Crub.toml"),
+        r#"
+        [package]
+        name = "en"
+        compiler = "gcc"
+        standard = "-std=c17"
+        source_dir = "./"
+        out_dir = "./build_crupp"
+        include_dirs = ["include"]
+
+        [[bin]]
+        name = "en_runner"
+        path = "game/main.c"
+        "#,
+    )
+    .unwrap();
+
+    let mut cmd = Command::cargo_bin("crupp").unwrap();
+    cmd.current_dir(root)
+        .env("CRUPP_NO_AUTO_NIX_SHELL", "1")
+        .arg("run")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("SCENE_COMPONENTS: 2, MAGIC: 77"));
+}
+
+#[test]
+fn test_compdb_generation_and_nixos_includes() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+
+    let mock_nix_inc = root.join("nix_store_mock_include");
+    fs::create_dir_all(&mock_nix_inc).unwrap();
+    fs::write(
+        mock_nix_inc.join("nix_mock_hdr.h"),
+        "#pragma once\n#define NIX_STORE_VAL 123\n",
+    )
+    .unwrap();
+
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/main.c"),
+        r#"
+        #include <stdio.h>
+        #include <nix_mock_hdr.h>
+        int main(void) {
+            printf("NIX_VAL: %d\n", NIX_STORE_VAL);
+            return 0;
+        }
+        "#,
+    )
+    .unwrap();
+
+    let nix_cflags = format!("-isystem {}", mock_nix_inc.display());
+
+    // 1. Generate compile_commands.json via 'crupp compdb' with NIX_CFLAGS_COMPILE
+    let mut compdb_cmd = Command::cargo_bin("crupp").unwrap();
+    compdb_cmd
+        .current_dir(root)
+        .env("CRUPP_NO_AUTO_NIX_SHELL", "1")
+        .env("NIX_CFLAGS_COMPILE", &nix_cflags)
+        .arg("compdb")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "compile_commands.json generated successfully",
+        ));
+
+    let compdb_content = fs::read_to_string(root.join("compile_commands.json")).unwrap();
+    assert!(compdb_content.contains("-isystem"));
+    assert!(compdb_content.contains(&mock_nix_inc.to_string_lossy().to_string()));
+    assert!(compdb_content.contains("tcc_home/include"));
+    assert!(root.join("build/obj/tcc_home/include/comptime.h").exists());
+
+    // 2. Also verify 'crupp run' honors NIX_CFLAGS_COMPILE
+    let mut run_cmd = Command::cargo_bin("crupp").unwrap();
+    run_cmd
+        .current_dir(root)
+        .env("CRUPP_NO_AUTO_NIX_SHELL", "1")
+        .env("NIX_CFLAGS_COMPILE", &nix_cflags)
+        .arg("run")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("NIX_VAL: 123"));
+}
+
+#[test]
+fn test_nix_shell_and_flake_generation() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/main.c"), "int main(void) { return 0; }\n").unwrap();
+    fs::write(
+        root.join("Crub.toml"),
+        r#"
+        [package]
+        name = "nix_demo"
+        compiler = "gcc"
+        standard = "-std=c17"
+        libs = ["z", "SDL2", "sqlite3"]
+        "#,
+    )
+    .unwrap();
+
+    let mut nix_cmd = Command::cargo_bin("crupp").unwrap();
+    nix_cmd
+        .current_dir(root)
+        .env("CRUPP_NO_AUTO_NIX_SHELL", "1")
+        .arg("nix")
+        .arg("--flake")
+        .arg("--envrc")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Created 'shell.nix'"))
+        .stdout(predicate::str::contains("Created 'flake.nix'"))
+        .stdout(predicate::str::contains("Created '.envrc'"));
+
+    let shell_nix = fs::read_to_string(root.join("shell.nix")).unwrap();
+    assert!(shell_nix.contains("pkg-config"));
+    assert!(shell_nix.contains("clang-tools"));
+    assert!(shell_nix.contains("zlib"));
+    assert!(shell_nix.contains("SDL2"));
+    assert!(shell_nix.contains("sqlite"));
+
+    let flake_nix = fs::read_to_string(root.join("flake.nix")).unwrap();
+    assert!(flake_nix.contains("devShells"));
+    assert!(flake_nix.contains("zlib"));
 }

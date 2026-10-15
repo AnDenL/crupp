@@ -37,6 +37,8 @@ pub async fn _build_project(manifest_path: &str, target_name: Option<&str>) -> R
 }
 
 pub async fn build_project_with_options(opts: BuildOptions<'_>) -> Result<(), String> {
+    crate::core::nix::activate_nix_env_if_available();
+
     let start_time = Instant::now();
     let (mut manifest, is_autodetected) = load_manifest_or_autodetect(opts.manifest_path)?;
 
@@ -78,6 +80,22 @@ pub async fn build_project_with_options(opts: BuildOptions<'_>) -> Result<(), St
         }
         true
     });
+
+    // If a specific target_name was requested and is not in manifest.bin, check tests/<target_name>.{c,cpp,cc,cxx}
+    if let Some(req_target) = opts.target_name {
+        if !manifest.bin.iter().any(|b| b.name == req_target) {
+            for ext in &["c", "cpp", "cc", "cxx"] {
+                let test_cand = Path::new("tests").join(format!("{}.{}", req_target, ext));
+                if test_cand.is_file() {
+                    manifest.bin.push(BinTarget {
+                        name: req_target.to_string(),
+                        path: test_cand.to_string_lossy().to_string(),
+                    });
+                    break;
+                }
+            }
+        }
+    }
 
     // 2. Discover bin paths if not already in units
     for bin in &manifest.bin {

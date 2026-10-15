@@ -11,6 +11,8 @@ use std::path::Path;
 
 #[tokio::main]
 async fn main() {
+    core::nix::activate_nix_env_if_available();
+
     let cli = Cli::parse();
     let verbose = cli.verbose;
 
@@ -206,6 +208,56 @@ async fn main() {
             }
         }
 
+        Commands::Nix {
+            manifest,
+            flake,
+            envrc,
+        } => {
+            println!(
+                "{}",
+                "❄️  Generating NixOS development environment...".bright_cyan().bold()
+            );
+            let (loaded_manifest, _) = match config::load_manifest_or_autodetect(manifest) {
+                Ok(res) => res,
+                Err(e) => {
+                    eprintln!("{} {}", "❌ Error:".red().bold(), e);
+                    std::process::exit(1);
+                }
+            };
+
+            let shell_content = core::nix::generate_shell_nix(&loaded_manifest);
+            if let Err(e) = fs::write("shell.nix", shell_content) {
+                eprintln!("{} Failed to write shell.nix: {}", "❌ Error:".red().bold(), e);
+                std::process::exit(1);
+            }
+            println!("{:>12} 'shell.nix'", "Created".green().bold());
+
+            if *flake {
+                let flake_content = core::nix::generate_flake_nix(&loaded_manifest);
+                if let Err(e) = fs::write("flake.nix", flake_content) {
+                    eprintln!("{} Failed to write flake.nix: {}", "❌ Error:".red().bold(), e);
+                    std::process::exit(1);
+                }
+                println!("{:>12} 'flake.nix'", "Created".green().bold());
+            }
+
+            if *envrc {
+                let envrc_content = if *flake { "use flake\n" } else { "use nix\n" };
+                let _ = fs::write(".envrc", envrc_content);
+                println!("{:>12} '.envrc'", "Created".green().bold());
+            }
+
+            println!(
+                "\n  {} Enter your NixOS environment with: {}",
+                "💡 Tip:".yellow().bold(),
+                if *flake {
+                    "nix develop".bright_green().bold()
+                } else {
+                    "nix-shell".bright_green().bold()
+                }
+            );
+        }
+
         Commands::Toml { name, lang } => {
             println!("{}", "Generating Crub.toml...".bright_green());
             let content = config::default_with_name_and_lang(name, lang.as_deref());
@@ -216,7 +268,7 @@ async fn main() {
             println!("{:>12} 'Crub.toml'", "Created".green().bold());
         }
 
-        Commands::Init { name, lang } => {
+        Commands::Init { name, lang, nix } => {
             let project_name = if name.is_empty() {
                 std::env::current_dir()
                     .ok()
@@ -252,8 +304,15 @@ async fn main() {
                 println!("{:>12} 'Crub.toml'", "Created".green().bold());
             }
 
+            if (*nix || core::nix::is_nix_env()) && !Path::new("shell.nix").exists() {
+                if let Ok((m, _)) = config::load_manifest_or_autodetect("Crub.toml") {
+                    let _ = fs::write("shell.nix", core::nix::generate_shell_nix(&m));
+                    println!("{:>12} 'shell.nix'", "Created".green().bold());
+                }
+            }
+
             if !Path::new(".gitignore").exists() {
-                let gitignore = "build/\ncompile_commands.json\n*.o\n*.pcm\n";
+                let gitignore = "build/\ncompile_commands.json\n*.o\n*.pcm\n.direnv/\nresult\n";
                 let _ = fs::write(".gitignore", gitignore);
                 println!("{:>12} '.gitignore'", "Created".green().bold());
             }
@@ -261,7 +320,7 @@ async fn main() {
             println!("{:>12} initialization!", "Finished".bright_green().bold());
         }
 
-        Commands::New { name, lang } => {
+        Commands::New { name, lang, nix } => {
             println!(
                 "{} new project in '{}'...",
                 "Creating".bright_green().bold(),
@@ -302,8 +361,17 @@ async fn main() {
             let toml_content = config::default_with_name_and_lang(name, Some(lang));
             let _ = fs::write(&toml_path, toml_content);
 
+            if *nix || core::nix::is_nix_env() {
+                if let Ok((m, _)) = config::load_manifest_or_autodetect(&toml_path) {
+                    let _ = fs::write(
+                        project_dir.join("shell.nix"),
+                        core::nix::generate_shell_nix(&m),
+                    );
+                }
+            }
+
             let gitignore_path = project_dir.join(".gitignore");
-            let gitignore = "build/\ncompile_commands.json\n*.o\n*.pcm\n";
+            let gitignore = "build/\ncompile_commands.json\n*.o\n*.pcm\n.direnv/\nresult\n";
             let _ = fs::write(&gitignore_path, gitignore);
 
             println!("{:>12} project '{}'!", "Created".bright_green().bold(), name);
@@ -335,6 +403,8 @@ async fn run_tests(manifest_path: &str, filter: Option<&str>, verbose: bool) -> 
             }
         }
     }
+
+    test_files.sort();
 
     if test_files.is_empty() {
         println!("No test sources found in 'tests/'.");

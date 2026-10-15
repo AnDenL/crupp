@@ -3,7 +3,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
+
+static COMPILER_USABLE_CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+
+fn get_usable_cache() -> &'static Mutex<HashMap<String, bool>> {
+    COMPILER_USABLE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Language {
@@ -125,7 +132,7 @@ pub fn default_cpp_standard() -> String {
 }
 
 pub fn default_c_standard() -> String {
-    "-std=c23".to_string()
+    "-std=c17".to_string()
 }
 
 fn default_source_dir() -> String {
@@ -201,7 +208,24 @@ pub enum CompilerType {
 
 impl Default for CompilerType {
     fn default() -> Self {
-        if is_command_available("clang") {
+        crate::core::nix::activate_nix_env_if_available();
+
+        // Respect CC environment variable when set inside nix-shell / nix develop
+        if let Ok(cc_env) = std::env::var("CC") {
+            let cc_trimmed = cc_env.trim();
+            if cc_trimmed.contains("gcc") && is_compiler_usable("gcc", Language::C) {
+                return CompilerType::Gcc;
+            }
+            if cc_trimmed.contains("clang") && is_compiler_usable("clang", Language::C) {
+                return CompilerType::Clang;
+            }
+        }
+
+        if is_compiler_usable("clang", Language::C) && is_compiler_usable("clang++", Language::Cpp) {
+            CompilerType::Clang
+        } else if is_compiler_usable("gcc", Language::C) {
+            CompilerType::Gcc
+        } else if is_command_available("clang") {
             CompilerType::Clang
         } else if is_command_available("gcc") {
             CompilerType::Gcc
@@ -214,9 +238,68 @@ impl Default for CompilerType {
 pub fn is_command_available(cmd: &str) -> bool {
     Command::new(cmd)
         .arg("--version")
-        .output()
-        .map(|o| o.status.success())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// Verifies not only that `cmd` exists in `PATH`, but that it can actually preprocess standard library headers
+/// (`<stdio.h>` for C or `<iostream>` for C++). On NixOS, this prevents selecting an unwrapped `clang` binary
+/// from `clang-tools` when `gcc` is the wrapped system/nix-shell compiler.
+pub fn is_compiler_usable(cmd: &str, lang: Language) -> bool {
+    crate::core::nix::activate_nix_env_if_available();
+
+    let lang_key = match lang {
+        Language::C => "c",
+        Language::Cpp => "c++",
+    };
+    let cache_key = format!("{}::{}", cmd, lang_key);
+
+    if let Ok(cache) = get_usable_cache().lock() {
+        if let Some(&usable) = cache.get(&cache_key) {
+            return usable;
+        }
+    }
+
+    if !is_command_available(cmd) {
+        if let Ok(mut cache) = get_usable_cache().lock() {
+            cache.insert(cache_key, false);
+        }
+        return false;
+    }
+
+    let test_src: &[u8] = match lang {
+        Language::C => b"#include <stdio.h>\nint main(void){return 0;}\n",
+        Language::Cpp => b"#include <iostream>\nint main(){return 0;}\n",
+    };
+
+    let mut probe = Command::new(cmd);
+    probe.args(["-E", "-x", lang_key, "-"]);
+    for flag in crate::core::nix::extra_compiler_flags(&[]) {
+        probe.arg(flag);
+    }
+    let usable = probe
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .and_then(|mut child| {
+            if let Some(mut stdin) = child.stdin.take() {
+                use std::io::Write;
+                let _ = stdin.write_all(test_src);
+            }
+            child.wait()
+        })
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    if let Ok(mut cache) = get_usable_cache().lock() {
+        cache.insert(cache_key, usable);
+    }
+
+    usable
 }
 
 impl CompilerType {
@@ -245,50 +328,87 @@ impl CompilerType {
     }
 
     /// Resolves the actual C compiler binary to run, with intelligent fallback
-    /// if the configured compiler is missing from PATH.
+    /// if the configured compiler is missing from PATH or unwrapped on NixOS.
     pub fn resolve_c_compiler(&self) -> (String, Option<String>) {
+        crate::core::nix::activate_nix_env_if_available();
         let requested = self.c_compiler();
-        if is_command_available(&requested) {
+        if is_compiler_usable(&requested, Language::C) {
             return (requested, None);
         }
 
         // Fallback resolution
-        if requested == "clang" && is_command_available("gcc") {
-            let note = "⚠️  'clang' was not found in PATH; automatically using 'gcc' as fallback."
+        if requested == "clang" && is_compiler_usable("gcc", Language::C) {
+            let note = "⚠️  'clang' was not found or is unwrapped; automatically using 'gcc' as fallback."
                 .yellow()
                 .to_string();
             return ("gcc".to_string(), Some(note));
-        } else if requested == "gcc" && is_command_available("clang") {
-            let note = "⚠️  'gcc' was not found in PATH; automatically using 'clang' as fallback."
+        } else if requested == "gcc" && is_compiler_usable("clang", Language::C) {
+            let note = "⚠️  'gcc' was not found or is unwrapped; automatically using 'clang' as fallback."
                 .yellow()
                 .to_string();
             return ("clang".to_string(), Some(note));
+        }
+
+        // Check CC env var or generic 'cc'
+        if let Ok(cc) = std::env::var("CC") {
+            let cc_trim = cc.trim();
+            if !cc_trim.is_empty() && is_command_available(cc_trim) {
+                return (cc_trim.to_string(), None);
+            }
+        }
+        if is_command_available(&requested) {
+            return (requested, None);
+        }
+        if requested == "clang" && is_command_available("gcc") {
+            return ("gcc".to_string(), None);
+        } else if requested == "gcc" && is_command_available("clang") {
+            return ("clang".to_string(), None);
+        } else if is_command_available("cc") {
+            return ("cc".to_string(), None);
         }
 
         (requested, None)
     }
 
     /// Resolves the actual C++ compiler binary to run, with intelligent fallback
-    /// if the configured compiler is missing from PATH.
+    /// if the configured compiler is missing from PATH or unwrapped on NixOS.
     pub fn resolve_cpp_compiler(&self) -> (String, Option<String>) {
+        crate::core::nix::activate_nix_env_if_available();
         let requested = self.cpp_compiler();
-        if is_command_available(&requested) {
+        if is_compiler_usable(&requested, Language::Cpp) {
             return (requested, None);
         }
 
         // Fallback resolution
-        if requested == "clang++" && is_command_available("g++") {
+        if requested == "clang++" && is_compiler_usable("g++", Language::Cpp) {
             let note =
-                "⚠️  'clang++' was not found in PATH; automatically using 'g++' as fallback."
+                "⚠️  'clang++' was not found or is unwrapped; automatically using 'g++' as fallback."
                     .yellow()
                     .to_string();
             return ("g++".to_string(), Some(note));
-        } else if requested == "g++" && is_command_available("clang++") {
+        } else if requested == "g++" && is_compiler_usable("clang++", Language::Cpp) {
             let note =
-                "⚠️  'g++' was not found in PATH; automatically using 'clang++' as fallback."
+                "⚠️  'g++' was not found or is unwrapped; automatically using 'clang++' as fallback."
                     .yellow()
                     .to_string();
             return ("clang++".to_string(), Some(note));
+        }
+
+        if let Ok(cxx) = std::env::var("CXX") {
+            let cxx_trim = cxx.trim();
+            if !cxx_trim.is_empty() && is_command_available(cxx_trim) {
+                return (cxx_trim.to_string(), None);
+            }
+        }
+        if is_command_available(&requested) {
+            return (requested, None);
+        }
+        if requested == "clang++" && is_command_available("g++") {
+            return ("g++".to_string(), None);
+        } else if requested == "g++" && is_command_available("clang++") {
+            return ("clang++".to_string(), None);
+        } else if is_command_available("c++") {
+            return ("c++".to_string(), None);
         }
 
         (requested, None)
@@ -300,12 +420,22 @@ impl CompilerType {
         is_export: bool,
         mod_name: &Option<String>,
     ) -> Vec<String> {
-        let is_clang = match self {
-            CompilerType::Clang => true,
-            CompilerType::Custom(cmd) => cmd.contains("clang"),
-            _ => false,
-        };
+        let (resolved_cpp, _) = self.resolve_cpp_compiler();
+        Self::get_module_flags_for_binary(&resolved_cpp, obj_dir, is_export, mod_name, true)
+    }
 
+    pub fn get_module_flags_for_binary(
+        compiler_bin: &str,
+        obj_dir: &Path,
+        is_export: bool,
+        mod_name: &Option<String>,
+        has_imports: bool,
+    ) -> Vec<String> {
+        if !is_export && !has_imports {
+            return vec![];
+        }
+
+        let is_clang = compiler_bin.contains("clang");
         if is_clang {
             let mut args = vec![format!(
                 "-fprebuilt-module-path={}",
@@ -318,18 +448,13 @@ impl CompilerType {
                 }
             }
             args
+        } else if compiler_bin.contains("gcc")
+            || compiler_bin.contains("g++")
+            || compiler_bin.contains("c++")
+        {
+            vec!["-fmodules-ts".to_string()]
         } else {
-            // GCC C++20 modules support
-            let is_gcc = match self {
-                CompilerType::Gcc => true,
-                CompilerType::Custom(cmd) => cmd.contains("gcc") || cmd.contains("g++"),
-                _ => false,
-            };
-            if is_gcc {
-                vec!["-fmodules-ts".to_string()]
-            } else {
-                vec![]
-            }
+            vec![]
         }
     }
 }
@@ -396,10 +521,10 @@ pub fn default_with_name(name: &str) -> String {
 }
 
 pub fn default_with_name_and_lang(name: &str, lang_pref: Option<&str>) -> String {
-    let preferred_compiler = if is_command_available("clang") {
-        "clang"
-    } else {
-        "gcc"
+    let preferred_compiler = match CompilerType::default() {
+        CompilerType::Clang => "clang",
+        CompilerType::Gcc => "gcc",
+        CompilerType::Custom(_) => "gcc",
     };
 
     // Auto-detect if user has C or C++ sources
@@ -443,10 +568,12 @@ pub enum LibCheckStatus {
         apt: String,
         pacman: String,
         dnf: String,
+        nix: String,
     },
 }
 
 pub fn check_system_library(lib_name: &str) -> LibCheckStatus {
+    crate::core::nix::activate_nix_env_if_available();
     let clean = lib_name.trim().trim_start_matches("-l").trim();
 
     // Standard C library math / pthread / dl are built into standard libc on Unix
@@ -482,18 +609,24 @@ pub fn check_system_library(lib_name: &str) -> LibCheckStatus {
         }
     }
 
-    // 2. Direct compiler linker probe (works even without pkg-config installed!)
+    // 2. Direct compiler linker probe (including NIX_LDFLAGS / LIBRARY_PATH)
     let (compiler, _) = CompilerType::default().resolve_c_compiler();
-    let probe_res = Command::new(&compiler)
+    let mut probe_cmd = Command::new(&compiler);
+    probe_cmd
         .arg("-x")
         .arg("c")
         .arg("-")
         .arg("-o")
-        .arg("/dev/null")
-        .arg(format!("-l{}", clean))
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .arg("/dev/null");
+    for flag in crate::core::nix::extra_linker_flags(&[], &[clean.to_string()]) {
+        probe_cmd.arg(flag);
+    }
+    probe_cmd.arg(format!("-l{}", clean));
+
+    let probe_res = probe_cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .and_then(|mut child| {
             if let Some(mut stdin) = child.stdin.take() {
@@ -509,34 +642,26 @@ pub fn check_system_library(lib_name: &str) -> LibCheckStatus {
         }
     }
 
-    // 3. Fallback filesystem search across standard library locations
+    // 3. Fallback filesystem search across NixOS store / NIX_LDFLAGS / standard library locations
     let lib_patterns = [
         format!("lib{}.so", clean),
         format!("lib{}.a", clean),
         format!("lib{}.dylib", clean),
     ];
-    let search_roots = [
-        "/usr/lib",
-        "/usr/lib64",
-        "/usr/local/lib",
-        "/lib",
-        "/usr/lib/x86_64-linux-gnu",
-        "/usr/lib/aarch64-linux-gnu",
-        "/opt/homebrew/lib",
-    ];
+    let search_roots = crate::core::nix::discover_system_library_dirs(&compiler);
 
     for root in &search_roots {
-        let p = Path::new(root);
-        if p.is_dir() {
+        if root.is_dir() {
             for pattern in &lib_patterns {
-                if p.join(pattern).exists() {
-                    return LibCheckStatus::Installed(format!("found at {}/{}", root, pattern));
+                let cand = root.join(pattern);
+                if cand.exists() {
+                    return LibCheckStatus::Installed(format!("found at {}", cand.display()));
                 }
             }
         }
     }
 
-    // Not found — generate helpful package manager commands
+    // Not found — generate helpful package manager commands (including NixOS!)
     let apt_pkg = if clean.starts_with("lib") {
         format!("{}-dev", clean)
     } else {
@@ -544,11 +669,13 @@ pub fn check_system_library(lib_name: &str) -> LibCheckStatus {
     };
     let dnf_pkg = format!("{}-devel", clean);
     let pacman_pkg = clean.to_string();
+    let nix_pkg = crate::core::nix::map_lib_to_nix_pkg(clean).unwrap_or(clean);
 
     LibCheckStatus::Missing {
         apt: format!("sudo apt install {}", apt_pkg),
         pacman: format!("sudo pacman -S {}", pacman_pkg),
         dnf: format!("sudo dnf install {}", dnf_pkg),
+        nix: format!("nix-shell -p pkg-config {}  (or run 'crupp nix')", nix_pkg),
     }
 }
 
@@ -645,14 +772,20 @@ pub fn add_library_to_manifest(
             LibCheckStatus::Installed(detail) => {
                 check_note = format!("  {} Host check: {}", "✓".green().bold(), detail.dimmed());
             }
-            LibCheckStatus::Missing { apt, pacman, dnf } => {
+            LibCheckStatus::Missing {
+                apt,
+                pacman,
+                dnf,
+                nix,
+            } => {
                 check_note = format!(
-                    "  {} {}\n      {}\n        • Ubuntu/Debian: {}\n        • Arch Linux:    {}\n        • Fedora/RHEL:   {}",
+                    "  {} {}\n      {}\n        • NixOS:         {}\n        • Ubuntu/Debian: {}\n        • Arch Linux:    {}\n        • Fedora/RHEL:   {}",
                     "⚠️ ".yellow(),
                     format!("Library '{}' was NOT detected on this system!", clean_lib)
                         .yellow()
                         .bold(),
                     "Install command:".dimmed(),
+                    nix.cyan(),
                     apt.cyan(),
                     pacman.cyan(),
                     dnf.cyan()
@@ -665,6 +798,16 @@ pub fn add_library_to_manifest(
 
     let updated_toml = update_libs_in_toml(&content, &manifest.package.libs);
     fs::write(&manifest_path, updated_toml).map_err(|e| e.to_string())?;
+
+    // If shell.nix already exists in the project, automatically refresh it so the new library is added to buildInputs
+    if Path::new("shell.nix").exists() {
+        if let Ok((refreshed_manifest, _)) = load_manifest_or_autodetect(&manifest_path) {
+            let _ = fs::write(
+                "shell.nix",
+                crate::core::nix::generate_shell_nix(&refreshed_manifest),
+            );
+        }
+    }
 
     let summary = format!(
         "Added library '{}' to '{}'.",
@@ -748,7 +891,12 @@ pub fn check_manifest_libraries(manifest_path_str: &str) -> Result<(), String> {
                 );
                 installed_count += 1;
             }
-            LibCheckStatus::Missing { apt, pacman, dnf } => {
+            LibCheckStatus::Missing {
+                apt,
+                pacman,
+                dnf,
+                nix,
+            } => {
                 println!(
                     "  {} {:<16} {}",
                     "✗".red().bold(),
@@ -756,6 +904,7 @@ pub fn check_manifest_libraries(manifest_path_str: &str) -> Result<(), String> {
                     "NOT FOUND".red().bold()
                 );
                 println!("      Suggested install command:");
+                println!("        • NixOS:         {}", nix.cyan());
                 println!("        • Ubuntu/Debian: {}", apt.cyan());
                 println!("        • Arch Linux:    {}", pacman.cyan());
                 println!("        • Fedora/RHEL:   {}", dnf.cyan());
@@ -779,7 +928,7 @@ pub fn check_manifest_libraries(manifest_path_str: &str) -> Result<(), String> {
         println!(
             "{}",
             format!(
-                "Dependency status: {} installed, {} missing. Install missing packages before building.",
+                "Dependency status: {} installed, {} missing. Install missing packages before building (or run 'crupp nix' on NixOS).",
                 installed_count, missing_count
             )
             .yellow()

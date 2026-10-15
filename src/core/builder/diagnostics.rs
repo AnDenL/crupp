@@ -8,7 +8,7 @@ static RE_UNDEF: OnceLock<Regex> = OnceLock::new();
 pub fn explain_io_error(binary: &str, err: &std::io::Error) -> String {
     if err.kind() == std::io::ErrorKind::NotFound {
         format!(
-            "Compiler executable '{}' was not found in PATH!\n    💡 Solution: Install it (`sudo apt install clang gcc` or `sudo pacman -S clang gcc`) or adjust 'compiler' in Crub.toml.",
+            "Compiler executable '{}' was not found in PATH!\n    💡 Solution: Install it (`nix-shell -p gcc clang` on NixOS, `sudo apt install clang gcc` on Ubuntu, or `sudo pacman -S clang gcc` on Arch) or adjust 'compiler' in Crub.toml.",
             binary
         )
     } else {
@@ -19,7 +19,7 @@ pub fn explain_io_error(binary: &str, err: &std::io::Error) -> String {
 pub fn explain_compiler_error(stderr: &str) {
     if stderr.contains("file not found") || stderr.contains("No such file or directory") {
         println!(
-            "    {} Header file not found. If this is a project header, check its folder is in 'include_dirs'. If external, install the corresponding -dev library.",
+            "    {} Header file not found. If this is a project header, check its folder is in 'include_dirs'. On NixOS, run 'crupp nix' and enter 'nix-shell' so NIX_CFLAGS_COMPILE is populated.",
             "💡 Tip:".yellow().bold()
         );
     }
@@ -55,61 +55,61 @@ static KNOWN_LIBS: &[KnownLib] = &[
         pattern: "cJSON_",
         lib_name: "cjson",
         description: "cJSON parser library",
-        package_hint: "libcjson-dev (Debian/Ubuntu) or cjson (Arch)",
+        package_hint: "libcjson-dev (Debian/Ubuntu), cjson (Arch / NixOS)",
     },
     KnownLib {
         pattern: "sqlite3_",
         lib_name: "sqlite3",
         description: "SQLite database engine",
-        package_hint: "libsqlite3-dev (Debian/Ubuntu) or sqlite (Arch)",
+        package_hint: "libsqlite3-dev (Debian/Ubuntu), sqlite (Arch / NixOS)",
     },
     KnownLib {
         pattern: "curl_",
         lib_name: "curl",
         description: "libcurl HTTP transfer library",
-        package_hint: "libcurl4-openssl-dev (Debian/Ubuntu) or curl (Arch)",
+        package_hint: "libcurl4-openssl-dev (Debian/Ubuntu), curl (Arch / NixOS)",
     },
     KnownLib {
         pattern: "SSL_",
         lib_name: "ssl",
         description: "OpenSSL SSL/TLS library",
-        package_hint: "libssl-dev (Debian/Ubuntu) or openssl (Arch)",
+        package_hint: "libssl-dev (Debian/Ubuntu), openssl (Arch / NixOS)",
     },
     KnownLib {
         pattern: "EVP_",
         lib_name: "crypto",
         description: "OpenSSL Cryptography library",
-        package_hint: "libssl-dev (Debian/Ubuntu) or openssl (Arch)",
+        package_hint: "libssl-dev (Debian/Ubuntu), openssl (Arch / NixOS)",
     },
     KnownLib {
         pattern: "BIO_",
         lib_name: "crypto",
         description: "OpenSSL Cryptography library",
-        package_hint: "libssl-dev (Debian/Ubuntu) or openssl (Arch)",
+        package_hint: "libssl-dev (Debian/Ubuntu), openssl (Arch / NixOS)",
     },
     KnownLib {
         pattern: "CRYPTO_",
         lib_name: "crypto",
         description: "OpenSSL Cryptography library",
-        package_hint: "libssl-dev (Debian/Ubuntu) or openssl (Arch)",
+        package_hint: "libssl-dev (Debian/Ubuntu), openssl (Arch / NixOS)",
     },
     KnownLib {
         pattern: "deflate",
         lib_name: "z",
         description: "zlib compression library",
-        package_hint: "zlib1g-dev (Debian/Ubuntu) or zlib (Arch)",
+        package_hint: "zlib1g-dev (Debian/Ubuntu), zlib (Arch / NixOS)",
     },
     KnownLib {
         pattern: "inflate",
         lib_name: "z",
         description: "zlib compression library",
-        package_hint: "zlib1g-dev (Debian/Ubuntu) or zlib (Arch)",
+        package_hint: "zlib1g-dev (Debian/Ubuntu), zlib (Arch / NixOS)",
     },
     KnownLib {
         pattern: "SDL_",
         lib_name: "SDL2",
         description: "SDL2 multimedia library",
-        package_hint: "libsdl2-dev (Debian/Ubuntu) or sdl2 (Arch)",
+        package_hint: "libsdl2-dev (Debian/Ubuntu), sdl2 (Arch), SDL2 (NixOS)",
     },
     KnownLib {
         pattern: "sin",
@@ -169,55 +169,55 @@ static KNOWN_LIBS: &[KnownLib] = &[
         pattern: "yaml_",
         lib_name: "yaml",
         description: "LibYAML parser library",
-        package_hint: "libyaml-dev (Debian/Ubuntu) or libyaml (Arch)",
+        package_hint: "libyaml-dev (Debian/Ubuntu), libyaml (Arch / NixOS)",
     },
     KnownLib {
         pattern: "xmlParse",
         lib_name: "xml2",
         description: "LibXML2 parser library",
-        package_hint: "libxml2-dev (Debian/Ubuntu) or libxml2 (Arch)",
+        package_hint: "libxml2-dev (Debian/Ubuntu), libxml2 (Arch / NixOS)",
     },
     KnownLib {
         pattern: "archive_",
         lib_name: "archive",
         description: "Libarchive library",
-        package_hint: "libarchive-dev (Debian/Ubuntu) or libarchive (Arch)",
+        package_hint: "libarchive-dev (Debian/Ubuntu), libarchive (Arch / NixOS)",
     },
     KnownLib {
         pattern: "uv_",
         lib_name: "uv",
         description: "Libuv asynchronous I/O library",
-        package_hint: "libuv1-dev (Debian/Ubuntu) or libuv (Arch)",
+        package_hint: "libuv1-dev (Debian/Ubuntu), libuv (Arch / NixOS)",
     },
     KnownLib {
         pattern: "pcre2_",
         lib_name: "pcre2-8",
         description: "PCRE2 regular expressions library",
-        package_hint: "libpcre2-dev (Debian/Ubuntu) or pcre2 (Arch)",
+        package_hint: "libpcre2-dev (Debian/Ubuntu), pcre2 (Arch / NixOS)",
     },
     KnownLib {
         pattern: "pcre_",
         lib_name: "pcre",
         description: "PCRE regular expressions library",
-        package_hint: "libpcre3-dev (Debian/Ubuntu) or pcre (Arch)",
+        package_hint: "libpcre3-dev (Debian/Ubuntu), pcre (Arch / NixOS)",
     },
     KnownLib {
         pattern: "XOpenDisplay",
         lib_name: "X11",
         description: "X11 windowing library",
-        package_hint: "libx11-dev (Debian/Ubuntu) or libx11 (Arch)",
+        package_hint: "libx11-dev (Debian/Ubuntu), libx11 (Arch), xorg.libX11 (NixOS)",
     },
     KnownLib {
         pattern: "glBegin",
         lib_name: "GL",
         description: "OpenGL graphics library",
-        package_hint: "libgl1-mesa-dev (Debian/Ubuntu) or mesa (Arch)",
+        package_hint: "libgl1-mesa-dev (Debian/Ubuntu), mesa (Arch), libGL (NixOS)",
     },
     KnownLib {
         pattern: "vkCreate",
         lib_name: "vulkan",
         description: "Vulkan graphics loader",
-        package_hint: "libvulkan-dev (Debian/Ubuntu) or vulkan-icd-loader (Arch)",
+        package_hint: "libvulkan-dev (Debian/Ubuntu), vulkan-icd-loader (Arch), vulkan-loader (NixOS)",
     },
 ];
 
@@ -325,9 +325,10 @@ pub fn explain_linker_error(stderr: &str) {
             println!("       libs = [\"{}\"]", lib_name.bright_green());
             if !pkg_hint.starts_with("built-in") {
                 println!(
-                    "    {} If not installed, run: {}",
+                    "    {} Package hint: {} (or run 'crupp add-lib {} && crupp nix' on NixOS)",
                     "📦 Package:".dimmed(),
-                    format!("sudo apt install {}", pkg_hint).cyan()
+                    pkg_hint.cyan(),
+                    lib_name
                 );
             }
             println!();

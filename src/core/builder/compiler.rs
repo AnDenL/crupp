@@ -34,7 +34,8 @@ pub async fn compile_unit(
         if let Ok(cached) = fs::read_to_string(&cache_file) {
             let mut valid = obj_path.exists();
             if let Language::Cpp = unit.language {
-                if let CompilerType::Clang = ctx.package.compiler {
+                let (resolved_cpp, _) = ctx.package.compiler.resolve_cpp_compiler();
+                if resolved_cpp.contains("clang") {
                     if let Some(mod_name) = &unit.exported_module {
                         valid = valid && ctx.obj_dir.join(format!("{}.pcm", mod_name)).exists();
                     }
@@ -65,9 +66,6 @@ pub async fn compile_unit(
 
     let raw_source = fs::read_to_string(&unit.path).map_err(|e| e.to_string())?;
     let file_to_compile = if crate::core::comptime::has_comptime_markers(&raw_source) {
-        let gen_dir = ctx.obj_dir.join("gen");
-        fs::create_dir_all(&gen_dir).map_err(|e| e.to_string())?;
-
         let transformed_code = crate::core::comptime::transform_comptime(
             &raw_source,
             &ctx.package.include_dirs,
@@ -75,16 +73,28 @@ pub async fn compile_unit(
             &unit.path,
         )?;
 
-        let shadow_file = gen_dir.join(unit.path.file_name().unwrap());
-        let abs_orig = fs::canonicalize(&unit.path).unwrap_or_else(|_| unit.path.clone());
-        let final_shadow_code = format!(
-            "#line 1 \"{}\"\n{}",
-            abs_orig.to_string_lossy(),
-            transformed_code
-        );
+        if transformed_code != raw_source {
+            let gen_dir = ctx.obj_dir.join("gen");
+            fs::create_dir_all(&gen_dir).map_err(|e| e.to_string())?;
 
-        fs::write(&shadow_file, final_shadow_code).map_err(|e| e.to_string())?;
-        shadow_file
+            let file_name = unit
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "unit.c".to_string());
+            let shadow_file = gen_dir.join(format!("{}_{}", safe_name, file_name));
+            let abs_orig = fs::canonicalize(&unit.path).unwrap_or_else(|_| unit.path.clone());
+            let escaped_orig = abs_orig
+                .to_string_lossy()
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"");
+            let final_shadow_code = format!("#line 1 \"{}\"\n{}", escaped_orig, transformed_code);
+
+            fs::write(&shadow_file, final_shadow_code).map_err(|e| e.to_string())?;
+            shadow_file
+        } else {
+            unit.path.clone()
+        }
     } else {
         unit.path.clone()
     };
@@ -121,6 +131,9 @@ pub async fn compile_unit(
             cmd.arg(part);
         }
     }
+    for extra in crate::core::nix::extra_compiler_flags(&ctx.package.libs) {
+        cmd.arg(extra);
+    }
 
     cmd.arg("-DCOMPTIME=0");
     cmd.arg("-Dcomptime(x)=(x)");
@@ -151,10 +164,14 @@ pub async fn compile_unit(
 
     if unit.language == Language::Cpp {
         let is_export = unit.exported_module.is_some();
-        let module_flags =
-            ctx.package
-                .compiler
-                .get_module_flags(&ctx.obj_dir, is_export, &unit.exported_module);
+        let has_imports = !unit.imports.is_empty();
+        let module_flags = CompilerType::get_module_flags_for_binary(
+            &compiler_bin,
+            &ctx.obj_dir,
+            is_export,
+            &unit.exported_module,
+            has_imports,
+        );
         cmd.args(module_flags);
     }
 

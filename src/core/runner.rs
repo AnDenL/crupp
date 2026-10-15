@@ -23,6 +23,8 @@ pub async fn run_target_verbose(
     args: &[String],
     verbose: bool,
 ) -> Result<(), String> {
+    crate::core::nix::activate_nix_env_if_available();
+
     let (manifest, _) = load_manifest_or_autodetect(manifest_path)?;
     let build_dir = PathBuf::from(&manifest.package.out_dir);
 
@@ -108,6 +110,8 @@ pub async fn run_standalone_file(
     args: &[String],
     verbose: bool,
 ) -> Result<(), String> {
+    crate::core::nix::activate_nix_env_if_available();
+
     if !file_path.exists() {
         return Err(format!("Source file '{}' not found.", file_path.display()));
     }
@@ -229,6 +233,9 @@ pub async fn run_standalone_file(
             comp_cmd.arg(part);
         }
     }
+    for extra in crate::core::nix::extra_compiler_flags(&manifest.package.libs) {
+        comp_cmd.arg(extra);
+    }
 
     comp_cmd.arg("-DCOMPTIME=0");
     comp_cmd.arg("-Dcomptime(x)=(x)");
@@ -281,11 +288,10 @@ pub async fn run_standalone_file(
     }
     link_cmd.arg(&obj_path).arg("-o").arg(&bin_path);
 
-    for lib_dir in &manifest.package.lib_dirs {
-        let clean = lib_dir.trim().trim_start_matches("-L").trim();
-        if !clean.is_empty() {
-            link_cmd.arg(format!("-L{}", clean));
-        }
+    let nix_link_flags =
+        crate::core::nix::extra_linker_flags(&manifest.package.lib_dirs, &manifest.package.libs);
+    for flag in &nix_link_flags {
+        link_cmd.arg(flag);
     }
 
     let mut effective_libs = manifest.package.libs.clone();
@@ -295,7 +301,10 @@ pub async fn run_standalone_file(
     for lib in &effective_libs {
         let clean = lib.trim().trim_start_matches("-l").trim();
         if !clean.is_empty() {
-            link_cmd.arg(format!("-l{}", clean));
+            let l_flag = format!("-l{}", clean);
+            if !nix_link_flags.contains(&l_flag) {
+                link_cmd.arg(l_flag);
+            }
         }
     }
 

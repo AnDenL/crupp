@@ -4,23 +4,19 @@ pub mod parser;
 pub mod types;
 
 use regex::Regex;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 pub fn has_comptime_markers(content: &str) -> bool {
-    content.contains("comptime")
-        || content.contains("COMPTIME")
-        || content.contains("Comptime")
-        || content.contains("tcc(")
-        || content.contains("TCC(")
-        || content.lines().any(|l| {
-            let t = l.trim_start();
-            t.starts_with('#') && {
-                let lower = t.to_ascii_lowercase();
-                lower.contains("comptime") || lower.contains("tcc(")
-            }
-        })
+    let lower = content.to_ascii_lowercase();
+    lower.contains("comptime") || lower.contains("tcc(")
+}
+
+fn escape_c_path(p: &Path) -> String {
+    p.to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
 }
 
 pub fn transform_comptime(
@@ -33,44 +29,77 @@ pub fn transform_comptime(
         return Ok(content.to_string());
     }
 
-    // 1. Extract static reflection metadata across current file and all transitively included headers
+    // Quick check if there are any actual comptime blocks or expressions outside comments
+    let has_block = find_next_comptime_block(content, origin_file)?.is_some();
+    let has_expr = find_next_comptime_expr(content).is_some();
+    if !has_block && !has_expr {
+        return Ok(content.to_string());
+    }
+
+    // 1. Extract static reflection metadata across current file and all project headers
     let (structs, enums) = collect_all_declarations(content, origin_file, include_dirs);
 
-    // 2. Generate specialized <comptime.h> header with reflection database & code generators
+    // 2. Generate specialized <comptime.h> into an isolated per-unit directory
     let comptime_h = header::generate_comptime_header(&structs, &enums);
-    let tcc_home = executor::prepare_embedded_headers(obj_dir, Some(&comptime_h));
+    let (tcc_home, unit_inc_dir) =
+        executor::prepare_unit_headers(obj_dir, origin_file, &comptime_h);
+
+    let abs_origin = fs::canonicalize(origin_file).unwrap_or_else(|_| origin_file.to_path_buf());
+    let escaped_origin = escape_c_path(&abs_origin);
 
     let mut result = content.to_string();
 
     // 3. Process '#if comptime ... #endif' metaprogramming blocks
-    while let Some((start_idx, end_idx, comptime_code)) = find_next_comptime_block(&result) {
-        let generated_c = executor::execute_c_code(&comptime_code, include_dirs, &tcc_home, origin_file)?;
-        result.replace_range(start_idx..end_idx, &generated_c);
+    while let Some(block) = find_next_comptime_block(&result, origin_file)? {
+        let generated_c = executor::execute_c_code(
+            &block.code,
+            block.body_start_line,
+            include_dirs,
+            &tcc_home,
+            &unit_inc_dir,
+            origin_file,
+        )?;
+
+        let replacement = format!(
+            "{}\n#line {} \"{}\"\n",
+            generated_c.trim_end(),
+            block.end_line + 1,
+            escaped_origin
+        );
+        result.replace_range(block.start_idx..block.end_idx, &replacement);
     }
 
     // 4. Process inline 'comptime(expr)' / 'tcc(expr)' evaluation macros
-    while let Some((start_idx, end_idx, expr)) = find_next_comptime_expr(&result) {
+    while let Some((start_idx, end_idx, expr_line, expr)) = find_next_comptime_expr(&result) {
         let wrapped_code = format!(
             r#"
-            #include <stdio.h>
-            #include <stdint.h>
-            #include <math.h>
+#include <comptime.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <math.h>
 
-            int main(void) {{
-                #define _crupp_print_val(x) _Generic((x), \
-                    float: printf("%ff", (double)(x)), \
-                    double: printf("%f", (double)(x)), \
-                    char*: printf("\"%s\"", (char*)(x)), \
-                    const char*: printf("\"%s\"", (const char*)(x)), \
-                    default: printf("%lld", (long long)(x)) \
-                )
-                _crupp_print_val({expr});
-                return 0;
-            }}
-            "#
+int main(void) {{
+    #define _crupp_emit_val(x) _Generic((x), \
+        float: emitf("%ff", (double)(x)), \
+        double: emitf("%f", (double)(x)), \
+        char*: emitf("\"%s\"", (char*)(x)), \
+        const char*: emitf("\"%s\"", (const char*)(x)), \
+        default: emitf("%lld", (long long)(x)) \
+    )
+    _crupp_emit_val({expr});
+    return 0;
+}}
+"#
         );
 
-        let generated_val = executor::execute_c_code(&wrapped_code, include_dirs, &tcc_home, origin_file)?;
+        let generated_val = executor::execute_c_code(
+            &wrapped_code,
+            expr_line,
+            include_dirs,
+            &tcc_home,
+            &unit_inc_dir,
+            origin_file,
+        )?;
         result.replace_range(start_idx..end_idx, generated_val.trim());
     }
 
@@ -84,35 +113,46 @@ fn collect_all_declarations(
 ) -> (Vec<types::CtStruct>, Vec<types::CtEnum>) {
     let mut all_structs: Vec<types::CtStruct> = Vec::new();
     let mut all_enums: Vec<types::CtEnum> = Vec::new();
-    let mut seen_struct_names: HashSet<String> = HashSet::new();
-    let mut seen_enum_names: HashSet<String> = HashSet::new();
 
     let mut visited_headers: HashSet<PathBuf> = HashSet::new();
-    let mut header_queue: Vec<PathBuf> = Vec::new();
+    let mut header_queue: VecDeque<PathBuf> = VecDeque::new();
+
+    if let Ok(canon_orig) = fs::canonicalize(origin_file) {
+        visited_headers.insert(canon_orig);
+    }
 
     // A. Parse the current file itself
     let (curr_structs, curr_enums) = parser::parse_c_declarations(content);
     for s in curr_structs {
-        seen_struct_names.insert(s.name.clone());
-        all_structs.push(s);
+        merge_struct(&mut all_structs, s);
     }
     for e in curr_enums {
-        seen_enum_names.insert(e.name.clone());
-        all_enums.push(e);
+        merge_enum(&mut all_enums, e);
     }
 
-    // B. Find direct headers from current file
-    find_included_headers(content, origin_file, include_dirs, &mut header_queue, &mut visited_headers);
+    // B. Find direct headers included by current file
+    find_included_headers(
+        content,
+        origin_file,
+        include_dirs,
+        &mut header_queue,
+        &mut visited_headers,
+    );
 
-    // C. Scan configured include directories for project headers (.h, .hpp)
+    // C. Scan configured include directories AND standard project dirs (include/, src/)
     let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut scan_roots: Vec<PathBuf> = Vec::new();
+
     for inc_dir in include_dirs {
         let clean = inc_dir.trim().trim_start_matches("-I").trim();
         if clean.is_empty() {
             continue;
         }
         let clean_lower = clean.to_ascii_lowercase();
-        if clean_lower.contains("vendor") || clean_lower.contains("third_party") || clean_lower.contains("external") {
+        if clean_lower.contains("vendor")
+            || clean_lower.contains("third_party")
+            || clean_lower.contains("external")
+        {
             continue;
         }
         let p = Path::new(clean);
@@ -121,92 +161,151 @@ fn collect_all_declarations(
         } else {
             p.to_path_buf()
         };
+        if search_path.is_dir() && !scan_roots.contains(&search_path) {
+            scan_roots.push(search_path);
+        }
+    }
 
-        if search_path.is_dir() {
-            for entry in walkdir::WalkDir::new(&search_path)
-                .max_depth(5)
-                .into_iter()
-                .filter_entry(|e| {
-                    if e.depth() == 0 {
-                        return true;
-                    }
-                    let name = e.file_name().to_string_lossy();
-                    if name.starts_with('.') {
-                        return false;
-                    }
-                    let name_lower = name.to_ascii_lowercase();
-                    if name == "target" || name == "build" || name == "build_crupp"
-                        || name_lower == "vendor" || name_lower == "third_party" || name_lower == "external" {
-                        return false;
-                    }
-                    true
-                })
-                .filter_map(|e| e.ok())
-            {
-                let path = entry.path();
-                if path.is_file() {
-                    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                        if matches!(ext, "h" | "hpp" | "hxx" | "hh" | "inl") {
-                            let canon = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-                            if visited_headers.insert(canon.clone()) {
-                                header_queue.push(canon);
-                            }
-                        }
+    for extra in &["include", "src"] {
+        let p = current_dir.join(extra);
+        if p.is_dir() && !scan_roots.contains(&p) {
+            scan_roots.push(p);
+        }
+    }
+
+    let mut discovered_files: Vec<PathBuf> = Vec::new();
+    for root in scan_roots {
+        for entry in walkdir::WalkDir::new(&root)
+            .max_depth(6)
+            .into_iter()
+            .filter_entry(|e| {
+                if e.depth() == 0 {
+                    return true;
+                }
+                let name = e.file_name().to_string_lossy();
+                if name.starts_with('.') {
+                    return false;
+                }
+                let name_lower = name.to_ascii_lowercase();
+                if matches!(
+                    name_lower.as_str(),
+                    "target"
+                        | "build"
+                        | "build_crupp"
+                        | "vendor"
+                        | "third_party"
+                        | "external"
+                        | "tests"
+                ) {
+                    return false;
+                }
+                true
+            })
+            .filter_map(|e| e.ok())
+        {
+            let path = entry.path();
+            if path.is_file() {
+                if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                    if matches!(ext, "h" | "hpp" | "hxx" | "hh" | "inl") {
+                        let canon = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+                        discovered_files.push(canon);
                     }
                 }
             }
         }
     }
 
+    // Sort deterministically so struct indices in _CT_ALL_STRUCTS are always consistent
+    discovered_files.sort();
+    for canon in discovered_files {
+        if visited_headers.insert(canon.clone()) {
+            header_queue.push_back(canon);
+        }
+    }
+
     // D. Transitive traversal of all discovered headers
-    while let Some(hdr_path) = header_queue.pop() {
+    while let Some(hdr_path) = header_queue.pop_front() {
         if let Ok(hdr_bytes) = fs::read(&hdr_path) {
             let hdr_content = String::from_utf8_lossy(&hdr_bytes);
             let (h_structs, h_enums) = parser::parse_c_declarations(&hdr_content);
 
             for s in h_structs {
-                if let Some(pos) = all_structs.iter().position(|x| x.name == s.name) {
-                    // If previous definition had no fields (forward declaration) and this one has fields, replace it!
-                    if all_structs[pos].fields.is_empty() && !s.fields.is_empty() {
-                        all_structs[pos] = s;
-                    } else if !s.attrs.is_empty() {
-                        // Merge attributes if new ones found
-                        for a in s.attrs {
-                            if !all_structs[pos].attrs.iter().any(|x| x.name == a.name) {
-                                all_structs[pos].attrs.push(a);
-                            }
-                        }
-                    }
-                } else {
-                    seen_struct_names.insert(s.name.clone());
-                    all_structs.push(s);
-                }
+                merge_struct(&mut all_structs, s);
             }
-
             for e in h_enums {
-                if let Some(pos) = all_enums.iter().position(|x| x.name == e.name) {
-                    if all_enums[pos].variants.is_empty() && !e.variants.is_empty() {
-                        all_enums[pos] = e;
-                    }
-                } else {
-                    seen_enum_names.insert(e.name.clone());
-                    all_enums.push(e);
-                }
+                merge_enum(&mut all_enums, e);
             }
 
-            // Inspect nested #includes in this header
-            find_included_headers(&hdr_content, &hdr_path, include_dirs, &mut header_queue, &mut visited_headers);
+            find_included_headers(
+                &hdr_content,
+                &hdr_path,
+                include_dirs,
+                &mut header_queue,
+                &mut visited_headers,
+            );
         }
     }
 
     (all_structs, all_enums)
 }
 
+fn merge_struct(all_structs: &mut Vec<types::CtStruct>, s: types::CtStruct) {
+    if let Some(existing) = all_structs.iter_mut().find(|x| x.name == s.name) {
+        if existing.fields.is_empty() && !s.fields.is_empty() {
+            let mut combined_attrs = existing.attrs.clone();
+            for a in s.attrs {
+                if !combined_attrs.iter().any(|x| x.name == a.name) {
+                    combined_attrs.push(a);
+                }
+            }
+            *existing = types::CtStruct {
+                name: s.name,
+                fields: s.fields,
+                attrs: combined_attrs,
+            };
+        } else {
+            for a in s.attrs {
+                if !existing.attrs.iter().any(|x| x.name == a.name) {
+                    existing.attrs.push(a);
+                }
+            }
+        }
+    } else {
+        all_structs.push(s);
+    }
+}
+
+fn merge_enum(all_enums: &mut Vec<types::CtEnum>, e: types::CtEnum) {
+    if let Some(existing) = all_enums.iter_mut().find(|x| x.name == e.name) {
+        if existing.variants.is_empty() && !e.variants.is_empty() {
+            let mut combined_attrs = existing.attrs.clone();
+            for a in e.attrs {
+                if !combined_attrs.iter().any(|x| x.name == a.name) {
+                    combined_attrs.push(a);
+                }
+            }
+            *existing = types::CtEnum {
+                name: e.name,
+                variants: e.variants,
+                attrs: combined_attrs,
+            };
+        } else {
+            for a in e.attrs {
+                if !existing.attrs.iter().any(|x| x.name == a.name) {
+                    existing.attrs.push(a);
+                }
+            }
+        }
+    } else {
+        all_enums.push(e);
+    }
+}
+
 fn find_included_headers(
     source_content: &str,
     current_file: &Path,
     include_dirs: &[String],
-    queue: &mut Vec<PathBuf>,
+    queue: &mut VecDeque<PathBuf>,
     visited: &mut HashSet<PathBuf>,
 ) {
     let re_inc = Regex::new(r#"^\s*#\s*include\s*["<]([^">]+)[">]"#).unwrap();
@@ -222,26 +321,37 @@ fn find_included_headers(
             if let Some(resolved) = resolve_include_path(inc_name, current_file, include_dirs) {
                 let canon = fs::canonicalize(&resolved).unwrap_or(resolved);
                 if visited.insert(canon.clone()) {
-                    queue.push(canon);
+                    queue.push_back(canon);
                 }
             }
         }
     }
 }
 
-fn resolve_include_path(inc: &str, current_file: &Path, include_dirs: &[String]) -> Option<PathBuf> {
-    // 1. Relative to current file's parent
-    if let Some(parent) = current_file.parent() {
+fn resolve_include_path(
+    inc: &str,
+    current_file: &Path,
+    include_dirs: &[String],
+) -> Option<PathBuf> {
+    // 1. Relative to current file's parent and ancestor directories
+    let mut anc = current_file.parent();
+    while let Some(parent) = anc {
         let candidate = parent.join(inc);
         if candidate.is_file() {
             return Some(candidate);
         }
+        if parent == Path::new("") || parent == Path::new(".") {
+            break;
+        }
+        anc = parent.parent();
     }
 
-    // 2. In current directory
-    let cand_cwd = Path::new(".").join(inc);
-    if cand_cwd.is_file() {
-        return Some(cand_cwd);
+    // 2. In current working directory, include/, or src/
+    for base_dir in &[".", "include", "src"] {
+        let cand = Path::new(base_dir).join(inc);
+        if cand.is_file() {
+            return Some(cand);
+        }
     }
 
     // 3. In each configured include directory
@@ -265,126 +375,324 @@ fn resolve_include_path(inc: &str, current_file: &Path, include_dirs: &[String])
     None
 }
 
-fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
-    if needle.is_empty() {
-        return Some(0);
-    }
-    let needle_bytes = needle.as_bytes();
-    let haystack_bytes = haystack.as_bytes();
-    if needle_bytes.len() > haystack_bytes.len() {
-        return None;
-    }
+// ============================================================================
+// Comment- & String-Aware Preprocessor Directive & Expression Scanners
+// ============================================================================
 
-    haystack_bytes.windows(needle_bytes.len()).position(|window| {
-        window
-            .iter()
-            .zip(needle_bytes)
-            .all(|(&h, &n)| h.to_ascii_lowercase() == n.to_ascii_lowercase())
-    })
+struct ComptimeBlock {
+    start_idx: usize,
+    end_idx: usize,
+    body_start_line: usize,
+    end_line: usize,
+    code: String,
 }
 
-fn find_next_comptime_block(source: &str) -> Option<(usize, usize, String)> {
-    let marker_candidates = ["#if comptime", "#ifdef comptime", "#if defined(comptime)"];
+/// Strips inline `//` and `/* ... */` comments from a single preprocessor directive line
+/// while tracking multi-line `/* ... */` block comment state across lines.
+fn extract_directive_from_line(line: &str, in_block_comment: &mut bool) -> Option<String> {
+    let bytes = line.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
 
-    let mut found_start = None;
-    let mut marker_len = 0;
-
-    for marker in &marker_candidates {
-        if let Some(idx) = find_ascii_case_insensitive(source, marker) {
-            if found_start.map_or(true, |curr| idx < curr) {
-                found_start = Some(idx);
-                marker_len = marker.len();
+    // If the line starts inside a multi-line /* ... */ comment, advance until `*/`
+    if *in_block_comment {
+        while i + 1 < len {
+            if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                *in_block_comment = false;
+                i += 2;
+                break;
             }
+            i += 1;
+        }
+        if *in_block_comment {
+            return None;
         }
     }
 
-    let start_idx = found_start?;
-    let body_start = source[start_idx + marker_len..]
-        .find('\n')
-        .map(|nl| start_idx + marker_len + nl + 1)?;
-
-    let mut depth = 1;
-    let mut current_idx = body_start;
-    let mut else_pos = None;
-
-    while depth > 0 && current_idx < source.len() {
-        let slice = &source[current_idx..];
-        if let Some(nl_rel) = slice.find('\n') {
-            let line = slice[..nl_rel].trim();
-            if line.starts_with("#if") {
-                depth += 1;
-            } else if depth == 1 && (line.starts_with("#else") || line.starts_with("#elif")) {
-                else_pos = Some(current_idx);
-            } else if line.starts_with("#endif") {
-                depth -= 1;
-                if depth == 0 {
-                    let end_idx = current_idx + nl_rel + 1;
-                    let comptime_src = if let Some(e_idx) = else_pos {
-                        source[body_start..e_idx].to_string()
-                    } else {
-                        source[body_start..current_idx].to_string()
-                    };
-                    return Some((start_idx, end_idx, comptime_src));
-                }
-            }
-            current_idx += nl_rel + 1;
-        } else {
-            break;
-        }
+    // Skip leading horizontal whitespace
+    while i < len && (bytes[i] == b' ' || bytes[i] == b'\t' || bytes[i] == b'\r') {
+        i += 1;
     }
 
-    None
-}
+    // Must start with '#' to be a real C preprocessor directive!
+    let is_directive = i < len && bytes[i] == b'#';
+    let mut clean = String::new();
 
-fn find_next_comptime_expr(source: &str) -> Option<(usize, usize, String)> {
-    let tags = ["comptime(", "tcc("];
-    let mut search_from = 0;
-
-    while search_from < source.len() {
-        let mut found = None;
-
-        for tag in &tags {
-            if let Some(idx) = source[search_from..].find(tag) {
-                let abs_idx = search_from + idx;
-                if found.map_or(true, |(curr, _)| abs_idx < curr) {
-                    found = Some((abs_idx, tag.len()));
-                }
+    while i < len {
+        if *in_block_comment {
+            if i + 1 < len && bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                *in_block_comment = false;
+                i += 2;
+            } else {
+                i += 1;
             }
-        }
-
-        let (start_pos, tag_len) = found?;
-        let expr_start = start_pos + tag_len;
-
-        let line_start = source[..start_pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
-        let line_prefix = source[line_start..start_pos].trim();
-        if line_prefix.starts_with('#') {
-            search_from = expr_start;
             continue;
         }
 
-        let mut depth = 1;
-        let mut end_pos = expr_start;
+        if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'/' {
+            break;
+        }
+        if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            *in_block_comment = true;
+            i += 2;
+            continue;
+        }
+        if bytes[i] != b'\r' {
+            clean.push(bytes[i] as char);
+        }
+        i += 1;
+    }
 
-        for (i, c) in source[expr_start..].char_indices() {
-            match c {
-                '(' => depth += 1,
-                ')' => {
+    if is_directive {
+        Some(clean.trim().to_string())
+    } else {
+        None
+    }
+}
+
+fn is_comptime_if_directive(directive: &str) -> bool {
+    let after_hash = directive.strip_prefix('#').unwrap_or(directive).trim_start();
+    let lower = after_hash.to_ascii_lowercase();
+    let tokens: Vec<&str> = lower.split_whitespace().collect();
+    if tokens.len() >= 2 && (tokens[0] == "if" || tokens[0] == "ifdef") {
+        let cond = tokens[1..].join("");
+        return cond == "comptime"
+            || cond == "defined(comptime)"
+            || cond == "comptime!=0"
+            || cond == "comptime==1";
+    }
+    false
+}
+
+fn classify_directive_keyword(directive: &str) -> Option<&'static str> {
+    let after_hash = directive.strip_prefix('#')?.trim_start();
+    let kw_end = after_hash
+        .find(|c: char| !c.is_ascii_alphabetic())
+        .unwrap_or(after_hash.len());
+    match &after_hash[..kw_end] {
+        "if" | "ifdef" | "ifndef" => Some("if"),
+        "else" | "elif" => Some("else"),
+        "endif" => Some("endif"),
+        _ => None,
+    }
+}
+
+/// Finds the next `#if comptime ... #endif` block, strictly ignoring `#if comptime` inside
+/// `//` line comments or `/* ... */` block comments.
+fn find_next_comptime_block(
+    source: &str,
+    origin_file: &Path,
+) -> Result<Option<ComptimeBlock>, String> {
+    let mut in_block_comment = false;
+    let mut byte_offset = 0usize;
+    let mut line_num = 0usize;
+
+    let mut active_start: Option<(usize, usize, usize)> = None; // (start_byte, body_start_byte, body_start_line)
+    let mut depth = 0usize;
+    let mut else_pos: Option<usize> = None;
+
+    for raw_line in source.split_inclusive('\n') {
+        line_num += 1;
+        let line_start = byte_offset;
+        let line_end = byte_offset + raw_line.len();
+        byte_offset = line_end;
+
+        let line_no_nl = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+        let directive_opt = extract_directive_from_line(line_no_nl, &mut in_block_comment);
+
+        let Some(directive) = directive_opt else {
+            continue;
+        };
+
+        if active_start.is_none() {
+            if is_comptime_if_directive(&directive) {
+                active_start = Some((line_start, line_end, line_num + 1));
+                depth = 1;
+                else_pos = None;
+            }
+        } else {
+            match classify_directive_keyword(&directive) {
+                Some("if") => {
+                    depth += 1;
+                }
+                Some("else") => {
+                    if depth == 1 && else_pos.is_none() {
+                        else_pos = Some(line_start);
+                    }
+                }
+                Some("endif") => {
                     depth -= 1;
                     if depth == 0 {
-                        end_pos = expr_start + i;
-                        break;
+                        let (start_idx, body_start, body_start_line) = active_start.unwrap();
+                        let code_end = else_pos.unwrap_or(line_start);
+                        let code = source[body_start..code_end].to_string();
+                        return Ok(Some(ComptimeBlock {
+                            start_idx,
+                            end_idx: line_end,
+                            body_start_line,
+                            end_line: line_num,
+                            code,
+                        }));
                     }
                 }
                 _ => {}
             }
         }
+    }
 
-        if depth == 0 {
-            let expr = source[expr_start..end_pos].trim().to_string();
-            return Some((start_pos, end_pos + 1, expr));
-        } else {
-            search_from = expr_start;
+    if let Some((_, _, body_start_line)) = active_start {
+        return Err(format!(
+            "Unclosed '#if comptime' block starting at {}:{} (missing matching '#endif')",
+            origin_file.display(),
+            body_start_line.saturating_sub(1)
+        ));
+    }
+
+    Ok(None)
+}
+
+/// Finds the next inline `comptime(expr)` or `tcc(expr)` call outside comments, strings, and `#define` lines.
+fn find_next_comptime_expr(source: &str) -> Option<(usize, usize, usize, String)> {
+    let bytes = source.as_bytes();
+    let len = bytes.len();
+    let mut i = 0usize;
+    let mut line_num = 1usize;
+    let mut at_line_start = true;
+
+    while i < len {
+        let b = bytes[i];
+        if b == b'\n' {
+            line_num += 1;
+            at_line_start = true;
+            i += 1;
+            continue;
         }
+
+        // Skip preprocessor lines (including backslash-continued lines)
+        if at_line_start {
+            if b == b' ' || b == b'\t' || b == b'\r' {
+                i += 1;
+                continue;
+            }
+            if b == b'#' {
+                while i < len {
+                    if bytes[i] == b'\\' && i + 1 < len && bytes[i + 1] == b'\n' {
+                        line_num += 1;
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == b'\n' {
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            at_line_start = false;
+        }
+
+        // Skip line comments
+        if b == b'/' && i + 1 < len && bytes[i + 1] == b'/' {
+            i += 2;
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+
+        // Skip block comments
+        if b == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                if bytes[i] == b'\n' {
+                    line_num += 1;
+                }
+                i += 1;
+            }
+            if i + 1 < len {
+                i += 2;
+            }
+            continue;
+        }
+
+        // Skip string and char literals
+        if b == b'"' || b == b'\'' {
+            let quote = b;
+            i += 1;
+            while i < len {
+                if bytes[i] == b'\\' && i + 1 < len {
+                    if bytes[i + 1] == b'\n' {
+                        line_num += 1;
+                    }
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == b'\n' {
+                    line_num += 1;
+                }
+                if bytes[i] == quote {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        // Check identifier boundary
+        if b.is_ascii_alphabetic() || b == b'_' {
+            let word_start = i;
+            let expr_line = line_num;
+            while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            let word = &source[word_start..i];
+            if word == "comptime" || word == "tcc" {
+                let mut j = i;
+                while j < len && (bytes[j] == b' ' || bytes[j] == b'\t') {
+                    j += 1;
+                }
+                if j < len && bytes[j] == b'(' {
+                    let expr_start = j + 1;
+                    let mut depth = 1usize;
+                    let mut k = expr_start;
+                    while k < len && depth > 0 {
+                        if bytes[k] == b'"' || bytes[k] == b'\'' {
+                            let q = bytes[k];
+                            k += 1;
+                            while k < len {
+                                if bytes[k] == b'\\' && k + 1 < len {
+                                    k += 2;
+                                    continue;
+                                }
+                                if bytes[k] == q {
+                                    k += 1;
+                                    break;
+                                }
+                                k += 1;
+                            }
+                            continue;
+                        }
+                        if bytes[k] == b'(' {
+                            depth += 1;
+                        } else if bytes[k] == b')' {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        k += 1;
+                    }
+                    if depth == 0 {
+                        let expr = source[expr_start..k].trim().to_string();
+                        return Some((word_start, k + 1, expr_line, expr));
+                    }
+                }
+            }
+            continue;
+        }
+
+        i += 1;
     }
 
     None
