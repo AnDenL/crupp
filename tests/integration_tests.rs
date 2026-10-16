@@ -1,8 +1,8 @@
 // Integration tests for Crupp build tool
 // Test suite covering multi-binary projects, root source_dir ("./"),
-// vendor source deduplication, comptime metaprogramming, standalone execution,
-// manifest commands (add-bin, add-lib, check-libs), build profiles,
-// and NixOS integration (compdb -isystem discovery, shell.nix/flake.nix generation, NIX_CFLAGS_COMPILE).
+// vendor source deduplication, comptime metaprogramming (emit & printf fallback),
+// standalone execution, manifest commands (add-bin, add-lib, check-libs),
+// build profiles, clangd LSP comptime header generation, and NixOS integration.
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -262,6 +262,61 @@ fn test_comptime_reflection_and_generation() {
 }
 
 #[test]
+fn test_comptime_printf_code_generation() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+
+    fs::create_dir_all(root.join("src")).unwrap();
+
+    // Matches tests/examples/comptime/src/main.c: uses printf/math inside #if COMPTIME without emit()
+    fs::write(
+        root.join("src/main.c"),
+        r#"
+        #include <stdio.h>
+
+        #if COMPTIME
+        #include <stdio.h>
+        #include <math.h>
+
+        int main(void) {
+            fprintf(stderr, "⚡ [crupp:comptime] Calculating table...\n");
+            printf("static const float SINS[3] = { %.6ff, %.6ff, %.6ff };\n",
+                sinf(0.0f), sinf(1.5707963f), sinf(3.1415926f));
+            return 0;
+        }
+        #endif
+
+        int main(void) {
+            printf("Generated sine 90 deg: %.2f\n", SINS[1]);
+            return 0;
+        }
+        "#,
+    )
+    .unwrap();
+
+    fs::write(
+        root.join("Crub.toml"),
+        r#"
+        [package]
+        name = "comptime_printf"
+        compiler = "gcc"
+        standard = "-std=c17"
+        source_dir = "./src"
+        out_dir = "./build"
+        "#,
+    )
+    .unwrap();
+
+    let mut cmd = Command::cargo_bin("crupp").unwrap();
+    cmd.current_dir(root)
+        .env("CRUPP_NO_AUTO_NIX_SHELL", "1")
+        .arg("run")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Generated sine 90 deg: 1.00"));
+}
+
+#[test]
 fn test_comptime_multi_file_headers() {
     let dir = tempdir().unwrap();
     let root = dir.path();
@@ -269,11 +324,15 @@ fn test_comptime_multi_file_headers() {
     fs::create_dir_all(root.join("include")).unwrap();
     fs::create_dir_all(root.join("src")).unwrap();
 
-    // 1. External header file with component definitions
+    // 1. External header file with component definitions (including extern "C" wrapper)
     fs::write(
         root.join("include/components.h"),
         r#"
         #pragma once
+
+        #ifdef __cplusplus
+        extern "C" {
+        #endif
 
         // @component @table("camera")
         typedef struct {
@@ -290,6 +349,10 @@ fn test_comptime_multi_file_headers() {
         typedef struct {
             int score;
         } UnreflectedState;
+
+        #ifdef __cplusplus
+        }
+        #endif
         "#,
     )
     .unwrap();
@@ -561,6 +624,10 @@ fn test_scene_comptime_with_comments_and_parallel_units() {
         root.join("include/en_components.h"),
         r#"
         #pragma once
+        #ifdef __cplusplus
+        extern "C" {
+        #endif
+
         typedef float f32;
         typedef int i32;
 
@@ -585,6 +652,10 @@ fn test_scene_comptime_with_comments_and_parallel_units() {
             f32 scale_x; // @default(1.0f)
             f32 scale_y; // @default(1.0f)
         } EnTransform2D;
+
+        #ifdef __cplusplus
+        }
+        #endif
         "#,
     )
     .unwrap();
@@ -594,6 +665,7 @@ fn test_scene_comptime_with_comments_and_parallel_units() {
         r#"
         #include "en_components.h"
         #include <stdio.h>
+        #include <string.h>
 
         // ============================================================================
         // COMPTIME GENERATOR BLOCK
@@ -611,15 +683,40 @@ fn test_scene_comptime_with_comments_and_parallel_units() {
             int total = struct_count();
             printf("Comptime debug: scanning %d structs\n", total);
 
+            int registred = 0;
+            for (int i = 0; i < total; i++) {
+                const ct_struct* s = get_struct(i);
+                printf("%s\n", s->name);
+                if (!struct_has_attr(s, "component")) continue;
+                registred++;
+
+                const char* table = struct_attr_or(s, "table", s->name);
+                emitf("static void init_%s(%s* out) {\n", table, s->name);
+                emitf("    *out = (%s){\n", s->name);
+                for (int j = 0; j < s->field_count; j++) {
+                    const ct_field* f = &s->fields[j];
+                    const char* def = field_get_attr(f, "def");
+                    // Also verify strcmp(def, ...) is NULL-safe even when def is NULL!
+                    if (strcmp(def, "") != 0 && strlen(def) > 0) {
+                        printf("        .%s = %s,\n", f->name, def);
+                        emitf("        .%s = %s,\n", f->name, def);
+                    }
+                }
+                emit("    };\n}\n\n");
+            }
+
             emit("void populate_scene_bundles(int* out_count) {\n");
+            emit("    EnCamera2D cam; init_camera(&cam);\n");
+            emit("    EnTransform2D tr; init_transform(&tr);\n");
             emit("    int c = 0;\n");
             for (int i = 0; i < total; i++) {
                 const ct_struct* s = get_struct(i);
                 if (!struct_has_attr(s, "component")) continue;
                 emitf("    c++; // %s\n", s->name);
             }
-            emit("    *out_count = c;\n");
+            emit("    if (cam.zoom == 64.0f && tr.scale_x == 1.0f) { *out_count = c; }\n");
             emit("}\n");
+            printf("Registred: %i\n", registred);
             return 0;
         }
         #endif
@@ -665,6 +762,7 @@ fn test_scene_comptime_with_comments_and_parallel_units() {
         source_dir = "./"
         out_dir = "./build_crupp"
         include_dirs = ["include"]
+        flags = ["-Wall", "-Wextra", "-Werror"]
 
         [[bin]]
         name = "en_runner"

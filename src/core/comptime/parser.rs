@@ -38,7 +38,131 @@ pub fn is_valid_c_ident(s: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// Extracts `@attr`, `@attr(val)`, `@attr("val")`, `#[attr]`, `#[attr(val)]` from comment text.
+/// Validates attribute names. Unlike C keywords, attribute names CAN match C keywords
+/// (e.g. `@default`, `@const`, `@static`, `@case`, `@inline`), because they are stored
+/// as string metadata in `ct_attr` (`.name = "default"`).
+pub fn is_valid_attr_ident(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => (),
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn push_unique_attr(attrs: &mut Vec<CtAttr>, name: String, value: String) {
+    if let Some(existing) = attrs.iter_mut().find(|a| a.name == name) {
+        if existing.value.is_empty() && !value.is_empty() {
+            existing.value = value;
+        }
+    } else {
+        attrs.push(CtAttr { name, value });
+    }
+}
+
+/// Parses comma-separated `key = val` or `key("val")` or `flag` sub-attributes inside `@attr(...)` or `#[...]`.
+fn parse_inner_sub_attrs(inner: &str, attrs: &mut Vec<CtAttr>) {
+    let bytes = inner.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    while i < len {
+        while i < len && (bytes[i].is_ascii_whitespace() || bytes[i] == b',') {
+            i += 1;
+        }
+        if i >= len {
+            break;
+        }
+
+        let name_start = i;
+        while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+            i += 1;
+        }
+        if i == name_start {
+            i += 1;
+            continue;
+        }
+        let sub_name = inner[name_start..i].to_string();
+        if !is_valid_attr_ident(&sub_name) {
+            continue;
+        }
+
+        while i < len && (bytes[i] == b' ' || bytes[i] == b'\t') {
+            i += 1;
+        }
+
+        if i < len && (bytes[i] == b'=' || bytes[i] == b':') {
+            i += 1;
+            while i < len && (bytes[i] == b' ' || bytes[i] == b'\t') {
+                i += 1;
+            }
+            if i < len && bytes[i] == b'"' {
+                i += 1;
+                let v_start = i;
+                while i < len && bytes[i] != b'"' {
+                    if bytes[i] == b'\\' && i + 1 < len {
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                let val = inner[v_start..i].to_string();
+                if i < len && bytes[i] == b'"' {
+                    i += 1;
+                }
+                push_unique_attr(attrs, sub_name, val);
+            } else {
+                let v_start = i;
+                let mut depth = 0usize;
+                while i < len && (depth > 0 || (bytes[i] != b',' && bytes[i] != b']')) {
+                    if bytes[i] == b'(' || bytes[i] == b'{' {
+                        depth += 1;
+                    } else if bytes[i] == b')' || bytes[i] == b'}' {
+                        depth = depth.saturating_sub(1);
+                    }
+                    i += 1;
+                }
+                let val = strip_outer_quotes(inner[v_start..i].trim()).to_string();
+                push_unique_attr(attrs, sub_name, val);
+            }
+        } else if i < len && bytes[i] == b'(' {
+            i += 1;
+            let v_start = i;
+            let mut depth = 1usize;
+            let mut in_quotes = false;
+            while i < len && depth > 0 {
+                if in_quotes {
+                    if bytes[i] == b'\\' && i + 1 < len {
+                        i += 2;
+                        continue;
+                    } else if bytes[i] == b'"' {
+                        in_quotes = false;
+                    }
+                } else if bytes[i] == b'"' {
+                    in_quotes = true;
+                } else if bytes[i] == b'(' {
+                    depth += 1;
+                } else if bytes[i] == b')' {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                i += 1;
+            }
+            let val = strip_outer_quotes(inner[v_start..i].trim()).to_string();
+            if i < len && bytes[i] == b')' {
+                i += 1;
+            }
+            push_unique_attr(attrs, sub_name, val);
+        }
+    }
+}
+
+/// Extracts `@attr`, `@attr(val)`, `@attr("val")`, `#[attr]`, `#[attr(val)]`, `#[attr, key = "val"]` from comment text.
 /// Ignores `@ident` inside backticks (e.g. `` `@component` `` in prose comments) or mid-word (`a@b`).
 pub fn extract_attributes(text: &str) -> Vec<CtAttr> {
     let mut attrs = Vec::new();
@@ -71,6 +195,38 @@ pub fn extract_attributes(text: &str) -> Vec<CtAttr> {
 
         if is_at {
             i += 1; // skip '@'
+            if i < len && bytes[i] == b'[' {
+                // Support @[component] syntax too
+                let bracket_start = i + 1;
+                let mut b_depth = 1usize;
+                i += 1;
+                while i < len && b_depth > 0 {
+                    if bytes[i] == b'[' {
+                        b_depth += 1;
+                    } else if bytes[i] == b']' {
+                        b_depth -= 1;
+                        if b_depth == 0 {
+                            break;
+                        }
+                    }
+                    i += 1;
+                }
+                let inner = &text[bracket_start..i];
+                parse_inner_sub_attrs(inner, &mut attrs);
+                // Also extract first word if bare flag like @[component]
+                let first_word: String = inner
+                    .trim_start()
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                if is_valid_attr_ident(&first_word) {
+                    push_unique_attr(&mut attrs, first_word, String::new());
+                }
+                if i < len && bytes[i] == b']' {
+                    i += 1;
+                }
+                continue;
+            }
         } else {
             i += 2; // skip '#['
             while i < len && (bytes[i] == b' ' || bytes[i] == b'\t') {
@@ -87,7 +243,7 @@ pub fn extract_attributes(text: &str) -> Vec<CtAttr> {
             continue;
         }
         let name = text[name_start..i].to_string();
-        if !is_valid_c_ident(&name) {
+        if !is_valid_attr_ident(&name) {
             continue;
         }
 
@@ -133,6 +289,10 @@ pub fn extract_attributes(text: &str) -> Vec<CtAttr> {
             }
             let raw_val = text[val_start..i].trim();
             value = strip_outer_quotes(raw_val).to_string();
+            // If raw_val contains key = value pairs (e.g. @component(table = "camera")), extract them too!
+            if raw_val.contains('=') || raw_val.contains(':') {
+                parse_inner_sub_attrs(raw_val, &mut attrs);
+            }
             if i < len && bytes[i] == b')' {
                 i += 1;
             }
@@ -170,16 +330,26 @@ pub fn extract_attributes(text: &str) -> Vec<CtAttr> {
         }
 
         if is_rust_attr {
+            let rem_start = i;
             while i < len && bytes[i] != b']' && bytes[i] != b'\n' {
                 i += 1;
+            }
+            let rem = text[rem_start..i].trim();
+            if !rem.is_empty() {
+                parse_inner_sub_attrs(rem, &mut attrs);
             }
             if i < len && bytes[i] == b']' {
                 i += 1;
             }
         }
 
-        if !attrs.iter().any(|a: &CtAttr| a.name == name) {
-            attrs.push(CtAttr { name, value });
+        // If user wrote `@component("camera")`, also populate `table = "camera"` if not already present
+        if name == "component" && !value.is_empty() && !value.contains('=') && !value.contains(':') {
+            let tbl_val = value.clone();
+            push_unique_attr(&mut attrs, name, value);
+            push_unique_attr(&mut attrs, "table".to_string(), tbl_val);
+        } else {
+            push_unique_attr(&mut attrs, name, value);
         }
     }
 
@@ -195,21 +365,39 @@ fn strip_outer_quotes(s: &str) -> &str {
     }
 }
 
-/// Collects only the contiguous block of comment lines immediately preceding `decl_byte_offset`.
-/// Stops immediately on any blank line or non-comment code line so file header banners never leak into structs.
+fn line_is_direct_annotation(trimmed: &str) -> bool {
+    let body = trimmed
+        .trim_start_matches("//")
+        .trim_start_matches("/*")
+        .trim_start_matches('*')
+        .trim_start();
+    body.starts_with('@') || body.starts_with("#[")
+}
+
+/// Collects the contiguous block of comment lines immediately preceding `decl_byte_offset`.
+/// Stops on blank lines for prose comments so file header banners never leak into structs,
+/// while tolerating a single blank line if the comment line directly above it starts with an explicit `@attr` or `#[attr]`.
 fn collect_preceding_comments(source: &str, decl_byte_offset: usize) -> String {
     let before = &source[..decl_byte_offset];
+    let rev_lines: Vec<&str> = before.lines().rev().collect();
     let mut collected_lines = Vec::new();
     let mut in_block_comment = false;
+    let mut idx = 0;
 
-    for line in before.lines().rev() {
+    while idx < rev_lines.len() {
+        let line = rev_lines[idx];
         let trimmed = line.trim();
         if trimmed.is_empty() {
             if in_block_comment {
                 collected_lines.push(line);
+                idx += 1;
                 continue;
             }
-            // Stop at blank line boundary!
+            // If there is a single blank line and the line immediately above it is an explicit `@attr` line, keep scanning
+            if idx + 1 < rev_lines.len() && line_is_direct_annotation(rev_lines[idx + 1].trim()) {
+                idx += 1;
+                continue;
+            }
             break;
         }
 
@@ -218,12 +406,13 @@ fn collect_preceding_comments(source: &str, decl_byte_offset: usize) -> String {
             if trimmed.contains("/*") {
                 in_block_comment = false;
             }
+            idx += 1;
             continue;
         }
 
         if trimmed.starts_with("//") {
             collected_lines.push(line);
-        } else if trimmed.ends_with("*/") {
+        } else if trimmed.ends_with("*/") || (trimmed.starts_with("/*") && trimmed.contains("*/")) {
             collected_lines.push(line);
             if !trimmed.contains("/*") {
                 in_block_comment = true;
@@ -232,6 +421,7 @@ fn collect_preceding_comments(source: &str, decl_byte_offset: usize) -> String {
             // Reached a code line or preprocessor directive
             break;
         }
+        idx += 1;
     }
 
     collected_lines.reverse();
@@ -239,34 +429,97 @@ fn collect_preceding_comments(source: &str, decl_byte_offset: usize) -> String {
 }
 
 /// Strips any `#if comptime ... #endif` blocks from source text before scanning for C declarations,
-/// so comptime generator code does not reflect over itself.
-fn mask_comptime_blocks(source: &str) -> String {
+/// strictly ignoring `#if comptime` inside `//` or `/* ... */` comments.
+pub fn mask_comptime_blocks(source: &str) -> String {
     let mut out = String::with_capacity(source.len());
     let mut depth = 0usize;
+    let mut in_block_comment = false;
 
     for line in source.lines() {
-        let trimmed = line.trim_start();
+        let bytes = line.as_bytes();
+        let len = bytes.len();
+        let mut i = 0;
+
+        if in_block_comment {
+            while i + 1 < len {
+                if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                    in_block_comment = false;
+                    i += 2;
+                    break;
+                }
+                i += 1;
+            }
+            if in_block_comment {
+                if depth == 0 {
+                    out.push_str(line);
+                }
+                out.push('\n');
+                continue;
+            }
+        }
+
+        while i < len && (bytes[i] == b' ' || bytes[i] == b'\t' || bytes[i] == b'\r') {
+            i += 1;
+        }
+
+        let is_directive = i < len && bytes[i] == b'#';
+        let mut clean_dir = String::new();
+
+        let mut scan_i = i;
+        while scan_i < len {
+            if in_block_comment {
+                if scan_i + 1 < len && bytes[scan_i] == b'*' && bytes[scan_i + 1] == b'/' {
+                    in_block_comment = false;
+                    scan_i += 2;
+                } else {
+                    scan_i += 1;
+                }
+                continue;
+            }
+            if scan_i + 1 < len && bytes[scan_i] == b'/' && bytes[scan_i + 1] == b'/' {
+                break;
+            }
+            if scan_i + 1 < len && bytes[scan_i] == b'/' && bytes[scan_i + 1] == b'*' {
+                in_block_comment = true;
+                scan_i += 2;
+                continue;
+            }
+            if is_directive && bytes[scan_i] != b'\r' {
+                clean_dir.push(bytes[scan_i] as char);
+            }
+            scan_i += 1;
+        }
+
         if depth == 0 {
-            if let Some(after_hash) = trimmed.strip_prefix('#') {
-                let directive = after_hash.trim_start().to_ascii_lowercase();
-                if directive.starts_with("if comptime")
-                    || directive.starts_with("ifdef comptime")
-                    || directive.starts_with("if defined(comptime)")
-                {
-                    depth = 1;
-                    out.push('\n');
-                    continue;
+            if is_directive {
+                let after_hash = clean_dir.strip_prefix('#').unwrap_or(&clean_dir).trim_start();
+                let lower = after_hash.to_ascii_lowercase();
+                let tokens: Vec<&str> = lower.split_whitespace().collect();
+                if tokens.len() >= 2 && (tokens[0] == "if" || tokens[0] == "ifdef") {
+                    let cond = tokens[1..].join("");
+                    if cond == "comptime"
+                        || cond == "defined(comptime)"
+                        || cond == "comptime!=0"
+                        || cond == "comptime==1"
+                    {
+                        depth = 1;
+                        out.push('\n');
+                        continue;
+                    }
                 }
             }
             out.push_str(line);
             out.push('\n');
         } else {
-            if let Some(after_hash) = trimmed.strip_prefix('#') {
-                let directive = after_hash.trim_start();
-                if directive.starts_with("if") {
-                    depth += 1;
-                } else if directive.starts_with("endif") {
-                    depth -= 1;
+            if is_directive {
+                let after_hash = clean_dir.strip_prefix('#').unwrap_or(&clean_dir).trim_start();
+                let kw_end = after_hash
+                    .find(|c: char| !c.is_ascii_alphabetic())
+                    .unwrap_or(after_hash.len());
+                match &after_hash[..kw_end] {
+                    "if" | "ifdef" | "ifndef" => depth += 1,
+                    "endif" => depth = depth.saturating_sub(1),
+                    _ => {}
                 }
             }
             out.push('\n');
@@ -274,6 +527,50 @@ fn mask_comptime_blocks(source: &str) -> String {
     }
 
     out
+}
+
+pub fn merge_struct_into(all_structs: &mut Vec<CtStruct>, s: CtStruct) {
+    if let Some(existing) = all_structs.iter_mut().find(|x| x.name == s.name) {
+        if existing.fields.is_empty() && !s.fields.is_empty() {
+            let mut combined_attrs = existing.attrs.clone();
+            for a in s.attrs {
+                push_unique_attr(&mut combined_attrs, a.name, a.value);
+            }
+            *existing = CtStruct {
+                name: s.name,
+                fields: s.fields,
+                attrs: combined_attrs,
+            };
+        } else {
+            for a in s.attrs {
+                push_unique_attr(&mut existing.attrs, a.name, a.value);
+            }
+        }
+    } else {
+        all_structs.push(s);
+    }
+}
+
+pub fn merge_enum_into(all_enums: &mut Vec<CtEnum>, e: CtEnum) {
+    if let Some(existing) = all_enums.iter_mut().find(|x| x.name == e.name) {
+        if existing.variants.is_empty() && !e.variants.is_empty() {
+            let mut combined_attrs = existing.attrs.clone();
+            for a in e.attrs {
+                push_unique_attr(&mut combined_attrs, a.name, a.value);
+            }
+            *existing = CtEnum {
+                name: e.name,
+                variants: e.variants,
+                attrs: combined_attrs,
+            };
+        } else {
+            for a in e.attrs {
+                push_unique_attr(&mut existing.attrs, a.name, a.value);
+            }
+        }
+    } else {
+        all_enums.push(e);
+    }
 }
 
 pub fn parse_c_declarations(raw_content: &str) -> (Vec<CtStruct>, Vec<CtEnum>) {
@@ -286,9 +583,56 @@ pub fn parse_c_declarations(raw_content: &str) -> (Vec<CtStruct>, Vec<CtEnum>) {
     let mut enums = Vec::new();
 
     let mut i = 0;
-    let mut brace_depth = 0usize;
+    let mut at_line_start = true;
 
     while i < len {
+        if bytes[i] == b'\n' {
+            at_line_start = true;
+            i += 1;
+            continue;
+        }
+
+        // Skip preprocessor directives (#define, #pragma, #include, #error, etc.) including \-continued lines,
+        // while keeping conditional directives (#if, #ifdef, #ifndef, #else, #elif, #endif) transparent.
+        if at_line_start {
+            if bytes[i] == b' ' || bytes[i] == b'\t' || bytes[i] == b'\r' {
+                i += 1;
+                continue;
+            }
+            if bytes[i] == b'#' {
+                let hash_pos = i;
+                i += 1;
+                while i < len && (bytes[i] == b' ' || bytes[i] == b'\t') {
+                    i += 1;
+                }
+                let kw_start = i;
+                while i < len && bytes[i].is_ascii_alphabetic() {
+                    i += 1;
+                }
+                let kw = &content[kw_start..i];
+                // Always skip the preprocessor line itself (including any backslash continuations for #define)
+                i = hash_pos;
+                while i < len {
+                    if bytes[i] == b'\\' && i + 1 < len {
+                        if bytes[i + 1] == b'\n' {
+                            i += 2;
+                            continue;
+                        } else if bytes[i + 1] == b'\r' && i + 2 < len && bytes[i + 2] == b'\n' {
+                            i += 3;
+                            continue;
+                        }
+                    }
+                    if bytes[i] == b'\n' {
+                        break;
+                    }
+                    i += 1;
+                }
+                let _ = kw;
+                continue;
+            }
+            at_line_start = false;
+        }
+
         // 1. Skip line comments
         if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'/' {
             i += 2;
@@ -298,13 +642,17 @@ pub fn parse_c_declarations(raw_content: &str) -> (Vec<CtStruct>, Vec<CtEnum>) {
             continue;
         }
 
-        // 2. Skip block comments
+        // 2. Skip block comments (bounds-safe!)
         if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
             i += 2;
             while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
                 i += 1;
             }
-            i += 2;
+            if i + 1 < len {
+                i += 2;
+            } else {
+                i = len;
+            }
             continue;
         }
 
@@ -326,20 +674,12 @@ pub fn parse_c_declarations(raw_content: &str) -> (Vec<CtStruct>, Vec<CtEnum>) {
             continue;
         }
 
-        // 4. Track brace depth
-        if bytes[i] == b'{' {
-            brace_depth += 1;
-            i += 1;
-            continue;
-        }
-        if bytes[i] == b'}' {
-            brace_depth = brace_depth.saturating_sub(1);
-            i += 1;
-            continue;
-        }
-
-        // Only inspect top-level declarations
-        if brace_depth == 0 && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
+        // Inspect identifiers for struct / enum / typedef declarations.
+        // Note: we intentionally do NOT gate on `brace_depth == 0` because C headers wrapped in
+        // `#ifdef __cplusplus \n extern "C" { \n #endif` or C++ `namespace { ... }` have outer `{`,
+        // and `try_parse_braced_declaration` strictly matches only real `[typedef] struct/enum [Tag] { ... }`
+        // type definitions while skipping over nested struct bodies via `i = next_idx`.
+        if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
             let word_start = i;
             while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                 i += 1;
@@ -354,7 +694,9 @@ pub fn parse_c_declarations(raw_content: &str) -> (Vec<CtStruct>, Vec<CtEnum>) {
                 let saved = skip_ws_and_comments(content, i);
                 let kw_start = saved;
                 let mut kw_end = kw_start;
-                while kw_end < len && (bytes[kw_end].is_ascii_alphanumeric() || bytes[kw_end] == b'_') {
+                while kw_end < len
+                    && (bytes[kw_end].is_ascii_alphanumeric() || bytes[kw_end] == b'_')
+                {
                     kw_end += 1;
                 }
                 let kw = &content[kw_start..kw_end];
@@ -368,15 +710,21 @@ pub fn parse_c_declarations(raw_content: &str) -> (Vec<CtStruct>, Vec<CtEnum>) {
             }
 
             if !decl_kind.is_empty() {
-                if let Some((tag_name, body_str, alias_name, next_idx)) =
-                    try_parse_braced_declaration(content, i)
+                if let Some((
+                    tag_name,
+                    body_str,
+                    alias_name,
+                    open_brace_idx,
+                    close_brace_idx,
+                    next_idx,
+                )) = try_parse_braced_declaration(content, i)
                 {
                     let name = if is_typedef && !alias_name.is_empty() {
-                        alias_name
+                        alias_name.clone()
                     } else if !tag_name.is_empty() {
-                        tag_name
+                        tag_name.clone()
                     } else {
-                        alias_name
+                        alias_name.clone()
                     };
 
                     if is_valid_c_ident(&name) {
@@ -384,28 +732,111 @@ pub fn parse_c_declarations(raw_content: &str) -> (Vec<CtStruct>, Vec<CtEnum>) {
                             .rfind('\n')
                             .map(|idx| idx + 1)
                             .unwrap_or(0);
-                        let prefix_comments = collect_preceding_comments(content, line_start);
-                        let attrs = extract_attributes(&prefix_comments);
+                        let mut combined_comment_text =
+                            collect_preceding_comments(content, line_start);
+
+                        // Also include any inline comments on the `typedef struct` line before `{`
+                        if open_brace_idx > line_start {
+                            combined_comment_text.push('\n');
+                            combined_comment_text.push_str(&content[line_start..open_brace_idx]);
+                        }
+
+                        // Check if there is a trailing comment on the opening `{` line itself (before any `;`)
+                        let mut clean_body = body_str;
+                        if let Some(first_nl) = clean_body.find('\n') {
+                            let first_line = &clean_body[..first_nl];
+                            if !first_line.contains(';') {
+                                if let Some(c_pos) =
+                                    first_line.find("//").or_else(|| first_line.find("/*"))
+                                {
+                                    combined_comment_text.push('\n');
+                                    combined_comment_text.push_str(&first_line[c_pos..]);
+                                    clean_body = format!(
+                                        "{}{}",
+                                        &first_line[..c_pos],
+                                        &clean_body[first_nl..]
+                                    );
+                                }
+                            }
+                        }
+
+                        // Also include any trailing comment between `}` and the end of the `} Name;` line
+                        let stmt_line_end = content[close_brace_idx..]
+                            .find('\n')
+                            .map(|off| close_brace_idx + off)
+                            .unwrap_or(len);
+                        if stmt_line_end > close_brace_idx {
+                            combined_comment_text.push('\n');
+                            combined_comment_text
+                                .push_str(&content[close_brace_idx..stmt_line_end]);
+                        }
+
+                        let attrs = extract_attributes(&combined_comment_text);
 
                         if decl_kind == "struct" {
-                            let fields = parse_struct_fields(&body_str);
-                            structs.push(CtStruct {
-                                name,
-                                fields,
-                                attrs,
-                            });
+                            let fields = parse_struct_fields(&clean_body);
+                            merge_struct_into(
+                                &mut structs,
+                                CtStruct {
+                                    name: name.clone(),
+                                    fields,
+                                    attrs: attrs.clone(),
+                                },
+                            );
                         } else if decl_kind == "enum" {
-                            let variants = parse_enum_variants(&body_str);
-                            enums.push(CtEnum {
-                                name,
-                                variants,
-                                attrs,
-                            });
+                            let variants = parse_enum_variants(&clean_body);
+                            merge_enum_into(
+                                &mut enums,
+                                CtEnum {
+                                    name: name.clone(),
+                                    variants,
+                                    attrs: attrs.clone(),
+                                },
+                            );
                         }
                     }
 
                     i = next_idx;
                     continue;
+                } else if is_typedef {
+                    // Check for annotated forward typedef: `// @component \n typedef struct Tag Alias;`
+                    if let Some((tag_name, alias_name, next_idx)) =
+                        try_parse_forward_typedef(content, i)
+                    {
+                        let line_start = content[..decl_start]
+                            .rfind('\n')
+                            .map(|idx| idx + 1)
+                            .unwrap_or(0);
+                        let prefix_comments = collect_preceding_comments(content, line_start);
+                        let attrs = extract_attributes(&prefix_comments);
+                        if !attrs.is_empty() {
+                            for n in [alias_name, tag_name] {
+                                if is_valid_c_ident(&n) {
+                                    if decl_kind == "struct" {
+                                        merge_struct_into(
+                                            &mut structs,
+                                            CtStruct {
+                                                name: n,
+                                                fields: Vec::new(),
+                                                attrs: attrs.clone(),
+                                            },
+                                        );
+                                    } else if decl_kind == "enum" {
+                                        merge_enum_into(
+                                            &mut enums,
+                                            CtEnum {
+                                                name: n,
+                                                variants: Vec::new(),
+                                                attrs: attrs.clone(),
+                                            },
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        i = next_idx;
+                        continue;
+                    }
                 }
             }
             continue;
@@ -433,7 +864,11 @@ fn skip_ws_and_comments(content: &str, mut i: usize) -> usize {
             while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
                 i += 1;
             }
-            i += 2;
+            if i + 1 < len {
+                i += 2;
+            } else {
+                i = len;
+            }
         } else {
             break;
         }
@@ -441,19 +876,13 @@ fn skip_ws_and_comments(content: &str, mut i: usize) -> usize {
     i
 }
 
-/// Starting right after `struct` or `enum`, parses optional tag name, `{ body }`, optional alias name, and `;`.
-/// Returns `None` if this is a forward declaration (`struct Foo;`) or variable/function return type without `{ ... }`.
-fn try_parse_braced_declaration(
-    content: &str,
-    start_after_kw: usize,
-) -> Option<(String, String, String, usize)> {
+fn try_parse_forward_typedef(content: &str, start_after_kw: usize) -> Option<(String, String, usize)> {
     let bytes = content.as_bytes();
     let len = bytes.len();
     let mut i = skip_ws_and_comments(content, start_after_kw);
+    let mut idents = Vec::new();
 
-    // Collect tokens before `{` or `;`
-    let mut tag_name = String::new();
-    while i < len && bytes[i] != b'{' && bytes[i] != b';' && bytes[i] != b'(' {
+    while i < len && bytes[i] != b';' && bytes[i] != b'{' && bytes[i] != b'(' {
         if bytes[i] == b'/' && i + 1 < len && (bytes[i + 1] == b'/' || bytes[i + 1] == b'*') {
             i = skip_ws_and_comments(content, i);
             continue;
@@ -463,12 +892,69 @@ fn try_parse_braced_declaration(
             while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                 i += 1;
             }
+            idents.push(content[w_start..i].to_string());
+        } else if bytes[i].is_ascii_whitespace() {
+            i += 1;
+        } else {
+            return None;
+        }
+    }
+
+    if i < len && bytes[i] == b';' && idents.len() == 2 {
+        Some((idents[0].clone(), idents[1].clone(), i + 1))
+    } else {
+        None
+    }
+}
+
+/// Starting right after `struct` or `enum`, parses optional tag name, `{ body }`, optional alias name, and `;`.
+/// Returns `None` if this is a forward declaration (`struct Foo;`) or variable/function return type without `{ ... }`.
+fn try_parse_braced_declaration(
+    content: &str,
+    start_after_kw: usize,
+) -> Option<(String, String, String, usize, usize, usize)> {
+    let bytes = content.as_bytes();
+    let len = bytes.len();
+    let mut i = skip_ws_and_comments(content, start_after_kw);
+
+    // Collect tokens before `{` or `;`
+    let mut tag_name = String::new();
+    let mut ident_count = 0usize;
+
+    while i < len && bytes[i] != b'{' && bytes[i] != b';' {
+        if bytes[i] == b'/' && i + 1 < len && (bytes[i + 1] == b'/' || bytes[i + 1] == b'*') {
+            i = skip_ws_and_comments(content, i);
+            continue;
+        }
+        // Handle C23/C++11 [[...]] attributes before `{`
+        if bytes[i] == b'[' && i + 1 < len && bytes[i + 1] == b'[' {
+            let mut b_depth = 1usize;
+            i += 2;
+            while i < len && b_depth > 0 {
+                if bytes[i] == b'[' {
+                    b_depth += 1;
+                } else if bytes[i] == b']' {
+                    b_depth = b_depth.saturating_sub(1);
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
+            let w_start = i;
+            while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
             let w = &content[w_start..i];
-            if w == "__attribute__" || w == "__declspec" {
-                i = skip_ws_and_comments(content, i);
-                if i < len && bytes[i] == b'(' {
+            let next_non_ws = skip_ws_and_comments(content, i);
+            if matches!(
+                w,
+                "__attribute__" | "__declspec" | "_Alignas" | "alignas"
+            ) || (next_non_ws < len && bytes[next_non_ws] == b'(' && ident_count == 0)
+            {
+                if next_non_ws < len && bytes[next_non_ws] == b'(' {
+                    i = next_non_ws + 1;
                     let mut p_depth = 1;
-                    i += 1;
                     while i < len && p_depth > 0 {
                         if bytes[i] == b'(' {
                             p_depth += 1;
@@ -479,12 +965,18 @@ fn try_parse_braced_declaration(
                     }
                 }
             } else {
+                // If we already saw a tag name and now see another identifier followed by `(`,
+                // this is a function returning `struct Tag func_name(...)`, NOT a struct definition!
+                if next_non_ws < len && bytes[next_non_ws] == b'(' {
+                    return None;
+                }
                 tag_name = w.to_string();
+                ident_count += 1;
             }
         } else if bytes[i].is_ascii_whitespace() {
             i += 1;
         } else {
-            // Unexpected token before `{` (e.g., pointer `struct Foo* bar()`)
+            // Unexpected token before `{` (e.g., pointer `struct Foo* bar()`, `=`, `,`, `(`)
             return None;
         }
     }
@@ -492,6 +984,8 @@ fn try_parse_braced_declaration(
     if i >= len || bytes[i] != b'{' {
         return None;
     }
+
+    let open_brace_idx = i;
 
     // Find matching `}` for `{`, ignoring comments and strings!
     let body_start = i + 1;
@@ -511,7 +1005,11 @@ fn try_parse_braced_declaration(
             while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
                 i += 1;
             }
-            i += 2;
+            if i + 1 < len {
+                i += 2;
+            } else {
+                i = len;
+            }
             continue;
         }
         if bytes[i] == b'"' || bytes[i] == b'\'' {
@@ -545,15 +1043,22 @@ fn try_parse_braced_declaration(
         return None;
     }
 
+    let close_brace_idx = i;
     let body_end = i;
     let body_str = content[body_start..body_end].to_string();
     i += 1; // skip '}'
 
-    // Parse optional alias name before ';'
+    // Parse optional alias name before ';' (taking the first non-attribute identifier before any ',')
     let mut alias_name = String::new();
+    let mut hit_comma = false;
     while i < len && bytes[i] != b';' {
         if bytes[i] == b'/' && i + 1 < len && (bytes[i + 1] == b'/' || bytes[i + 1] == b'*') {
             i = skip_ws_and_comments(content, i);
+            continue;
+        }
+        if bytes[i] == b',' {
+            hit_comma = true;
+            i += 1;
             continue;
         }
         if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
@@ -562,7 +1067,21 @@ fn try_parse_braced_declaration(
                 i += 1;
             }
             let w = &content[w_start..i];
-            if w != "__attribute__" && w != "packed" && w != "aligned" {
+            if w == "__attribute__" || w == "__declspec" || w == "_Alignas" || w == "alignas" {
+                i = skip_ws_and_comments(content, i);
+                if i < len && bytes[i] == b'(' {
+                    let mut p_depth = 1;
+                    i += 1;
+                    while i < len && p_depth > 0 {
+                        if bytes[i] == b'(' {
+                            p_depth += 1;
+                        } else if bytes[i] == b')' {
+                            p_depth -= 1;
+                        }
+                        i += 1;
+                    }
+                }
+            } else if !hit_comma && alias_name.is_empty() && w != "packed" && w != "aligned" {
                 alias_name = w.to_string();
             }
         } else {
@@ -574,7 +1093,14 @@ fn try_parse_braced_declaration(
         i += 1;
     }
 
-    Some((tag_name, body_str, alias_name, i))
+    Some((
+        tag_name,
+        body_str,
+        alias_name,
+        open_brace_idx,
+        close_brace_idx,
+        i,
+    ))
 }
 
 fn parse_struct_fields(body: &str) -> Vec<CtField> {
@@ -614,6 +1140,8 @@ fn parse_struct_fields(body: &str) -> Vec<CtField> {
             }
             if i + 1 < len {
                 i += 2;
+            } else {
+                i = len;
             }
             if nested_brace_depth == 0 {
                 pending_comments.push_str(&body[c_start..i]);
@@ -655,32 +1183,39 @@ fn parse_struct_fields(body: &str) -> Vec<CtField> {
         if bytes[i] == b';' {
             i += 1; // skip ';'
 
-            // Check if there is a trailing comment on the SAME line right after ';'
-            while i < len && (bytes[i] == b' ' || bytes[i] == b'\t') {
-                i += 1;
-            }
-            if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'/' {
-                let c_start = i;
-                i += 2;
-                while i < len && bytes[i] != b'\n' {
+            // Check if there are trailing comments on the SAME line right after ';'
+            loop {
+                while i < len && (bytes[i] == b' ' || bytes[i] == b'\t' || bytes[i] == b'\r') {
                     i += 1;
                 }
-                pending_comments.push_str(&body[c_start..i]);
-                pending_comments.push('\n');
-                if i < len && bytes[i] == b'\n' {
-                    i += 1;
-                }
-            } else if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'*' {
-                let c_start = i;
-                i += 2;
-                while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                    i += 1;
-                }
-                if i + 1 < len {
+                if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'/' {
+                    let c_start = i;
                     i += 2;
+                    while i < len && bytes[i] != b'\n' {
+                        i += 1;
+                    }
+                    pending_comments.push_str(&body[c_start..i]);
+                    pending_comments.push('\n');
+                    if i < len && bytes[i] == b'\n' {
+                        i += 1;
+                    }
+                    break;
+                } else if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                    let c_start = i;
+                    i += 2;
+                    while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                        i += 1;
+                    }
+                    if i + 1 < len {
+                        i += 2;
+                    } else {
+                        i = len;
+                    }
+                    pending_comments.push_str(&body[c_start..i]);
+                    pending_comments.push('\n');
+                } else {
+                    break;
                 }
-                pending_comments.push_str(&body[c_start..i]);
-                pending_comments.push('\n');
             }
 
             let stmt = current_code.trim();
@@ -708,8 +1243,12 @@ fn parse_single_field_stmt(stmt: &str, field_attrs: &[CtAttr], fields: &mut Vec<
     }
 
     let first = comma_parts[0];
-    // Handle bitfield `: width` on first declarator
-    let first_no_bitfield = first.split(':').next().unwrap_or(first).trim();
+    // Handle optional `= default_val` and bitfield `: width` on first declarator
+    let (first_no_eq, first_eq_def) = match first.split_once('=') {
+        Some((lhs, rhs)) => (lhs.trim(), Some(rhs.trim())),
+        None => (first, None),
+    };
+    let first_no_bitfield = first_no_eq.split(':').next().unwrap_or(first_no_eq).trim();
     let words: Vec<&str> = first_no_bitfield.split_whitespace().collect();
     if words.len() < 2 {
         return;
@@ -718,13 +1257,17 @@ fn parse_single_field_stmt(stmt: &str, field_attrs: &[CtAttr], fields: &mut Vec<
     let first_var = words[words.len() - 1];
     let base_type = words[..words.len() - 1].join(" ");
 
-    let mut all_vars = vec![first_var];
+    let mut all_vars = vec![(first_var, first_eq_def)];
     for part in &comma_parts[1..] {
-        let no_bf = part.split(':').next().unwrap_or(part).trim();
-        all_vars.push(no_bf);
+        let (no_eq, eq_def) = match part.split_once('=') {
+            Some((lhs, rhs)) => (lhs.trim(), Some(rhs.trim())),
+            None => (*part, None),
+        };
+        let no_bf = no_eq.split(':').next().unwrap_or(no_eq).trim();
+        all_vars.push((no_bf, eq_def));
     }
 
-    for v in all_vars {
+    for (v, inline_def) in all_vars {
         let mut var_str = v.trim();
         if var_str.is_empty() {
             continue;
@@ -762,13 +1305,27 @@ fn parse_single_field_stmt(stmt: &str, field_attrs: &[CtAttr], fields: &mut Vec<
 
         let kind = TypeKind::from_c_type(clean_base, is_ptr, array_len > 0);
 
+        let mut attrs = field_attrs.to_vec();
+        if let Some(def_val) = inline_def {
+            if !def_val.is_empty()
+                && !attrs
+                    .iter()
+                    .any(|a| a.name == "def" || a.name == "default")
+            {
+                attrs.push(CtAttr {
+                    name: "def".to_string(),
+                    value: def_val.to_string(),
+                });
+            }
+        }
+
         fields.push(CtField {
             name: var_str.to_string(),
             type_name: final_type,
             kind,
             is_pointer: is_ptr,
             array_len,
-            attrs: field_attrs.to_vec(),
+            attrs,
         });
     }
 }
@@ -805,70 +1362,46 @@ fn parse_enum_variants(body: &str) -> Vec<CtVariant> {
             }
             if i + 1 < len {
                 i += 2;
+            } else {
+                i = len;
             }
             pending_comments.push_str(&body[c_start..i]);
             pending_comments.push('\n');
             continue;
         }
 
-        if i == len || bytes[i] == b',' {
-            if i < len {
-                i += 1; // skip ','
-                while i < len && (bytes[i] == b' ' || bytes[i] == b'\t') {
-                    i += 1;
-                }
-                if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'/' {
-                    let c_start = i;
-                    i += 2;
-                    while i < len && bytes[i] != b'\n' {
-                        i += 1;
-                    }
-                    pending_comments.push_str(&body[c_start..i]);
-                    pending_comments.push('\n');
-                }
-            }
-
-            let clean = current_code.trim();
-            if !clean.is_empty() {
+        let is_sep = i == len || bytes[i] == b',' || bytes[i] == b';';
+        if is_sep {
+            let item = current_code.trim();
+            if !item.is_empty() {
                 let attrs = extract_attributes(&pending_comments);
-                if let Some(eq_idx) = clean.find('=') {
-                    let name = clean[..eq_idx].trim().to_string();
-                    let val_str = clean[eq_idx + 1..].trim();
-                    if let Ok(v) = val_str.parse::<i64>() {
-                        current_val = v;
-                    } else if let Some(hex_str) =
-                        val_str.strip_prefix("0x").or_else(|| val_str.strip_prefix("0X"))
-                    {
-                        if let Ok(v) = i64::from_str_radix(hex_str, 16) {
-                            current_val = v;
-                        }
-                    }
-                    if is_valid_c_ident(&name) {
-                        variants.push(CtVariant {
-                            name,
-                            value: current_val,
-                            attrs,
-                        });
-                        current_val += 1;
-                    }
+                let (name, val) = if let Some((n, v)) = item.split_once('=') {
+                    let clean_n = n.trim();
+                    let clean_v = v.trim();
+                    let parsed_v = if clean_v.starts_with("0x") || clean_v.starts_with("0X") {
+                        i64::from_str_radix(&clean_v[2..], 16).unwrap_or(current_val)
+                    } else {
+                        clean_v.parse::<i64>().unwrap_or(current_val)
+                    };
+                    current_val = parsed_v + 1;
+                    (clean_n.to_string(), parsed_v)
                 } else {
-                    let name = clean.split_whitespace().next().unwrap_or(clean).to_string();
-                    if is_valid_c_ident(&name) {
-                        variants.push(CtVariant {
-                            name,
-                            value: current_val,
-                            attrs,
-                        });
-                        current_val += 1;
-                    }
+                    let val = current_val;
+                    current_val += 1;
+                    (item.to_string(), val)
+                };
+
+                if is_valid_c_ident(&name) {
+                    variants.push(CtVariant {
+                        name,
+                        value: val,
+                        attrs,
+                    });
                 }
             }
-
             pending_comments.clear();
             current_code.clear();
-            if i == len {
-                break;
-            }
+            i += 1;
             continue;
         }
 

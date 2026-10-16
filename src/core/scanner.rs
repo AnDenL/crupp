@@ -119,12 +119,19 @@ pub fn strip_comments_fast(text: &str) -> String {
     unsafe { String::from_utf8_unchecked(out) }
 }
 
+/// Masks `#if comptime ... #endif` blocks so that metaprogramming code (including any `main()` or `proc()`
+/// written for compile-time execution) is never mistaken for a runtime binary `main()` entrypoint.
+pub fn mask_comptime_blocks(source: &str) -> String {
+    crate::core::comptime::parser::mask_comptime_blocks(source)
+}
+
 /// Discovers header dependencies for a source file and computes an aggregate hash of
 /// all local included headers transitively. This guarantees cache invalidation when a header changes.
 fn collect_header_dependencies(
     source_path: &Path,
     content: &str,
     include_dirs: &[String],
+    uses_comptime: bool,
 ) -> (Vec<PathBuf>, String) {
     let re_inc =
         RE_INCLUDE.get_or_init(|| Regex::new(r#"^\s*#\s*include\s*["<]([^">]+)[">]"#).unwrap());
@@ -153,11 +160,37 @@ fn collect_header_dependencies(
 
     // Recursively hash headers
     let mut queue = direct_headers.clone();
+
+    // If this unit uses `#if comptime`, also include all headers in `include/` and `src/` in the hash queue
+    // so adding or changing `// @component` in any project header immediately invalidates the cache!
+    if uses_comptime {
+        for base in &["include", "src"] {
+            let p = Path::new(base);
+            if p.is_dir() {
+                for entry in walkdir::WalkDir::new(p)
+                    .max_depth(6)
+                    .into_iter()
+                    .filter_map(|e| e.ok())
+                {
+                    if entry.path().is_file() {
+                        if let Some(ext) = entry.path().extension().and_then(|e| e.to_str()) {
+                            if matches!(ext, "h" | "hpp" | "hxx" | "hh" | "inl") {
+                                let canon = fs::canonicalize(entry.path())
+                                    .unwrap_or_else(|_| entry.path().to_path_buf());
+                                queue.push(canon);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut hashed_list = Vec::new();
     while let Some(hdr) = queue.pop() {
         if all_visited.insert(hdr.clone()) {
             if let Some(hash) = get_or_compute_header_hash(&hdr) {
-                header_hasher.update(hdr.to_string_lossy().as_bytes());
-                header_hasher.update(hash.as_bytes());
+                hashed_list.push((hdr.to_string_lossy().to_string(), hash));
 
                 // Inspect this header for nested includes
                 if let Ok(hdr_content) = fs::read_to_string(&hdr) {
@@ -181,6 +214,12 @@ fn collect_header_dependencies(
                 }
             }
         }
+    }
+
+    hashed_list.sort_by(|a, b| a.0.cmp(&b.0));
+    for (hdr_str, hash) in hashed_list {
+        header_hasher.update(hdr_str.as_bytes());
+        header_hasher.update(hash.as_bytes());
     }
 
     let headers_hash = hex::encode(header_hasher.finalize());
@@ -259,7 +298,7 @@ fn compute_base_hash(
     headers_hash: &str,
 ) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"crupp-cache-v5");
+    hasher.update(b"crupp-cache-v6");
     hasher.update(content.as_bytes());
     hasher.update(headers_hash.as_bytes());
 
@@ -299,9 +338,16 @@ pub fn scan_file(path: &Path, config: &Package) -> Option<TranslationUnit> {
     };
 
     let raw_content = fs::read_to_string(path).ok()?;
-    let content = strip_comments_fast(&raw_content);
 
-    // Fast-path: only invoke regex if "main" is present in stripped content
+    // Mask `#if comptime ... #endif` BEFORE stripping comments so `#if comptime` inside `/* ... */`
+    // is never misread and `main()` inside `#if comptime` is never mistaken for a binary entrypoint!
+    let masked_raw = if crate::core::comptime::has_comptime_markers(&raw_content) {
+        mask_comptime_blocks(&raw_content)
+    } else {
+        raw_content.clone()
+    };
+    let content = strip_comments_fast(&masked_raw);
+
     let has_main = if content.contains("main") {
         let re_main =
             RE_MAIN.get_or_init(|| Regex::new(r"(?m)\b(?:int|void|auto)\s+main\s*\(").unwrap());
@@ -335,8 +381,9 @@ pub fn scan_file(path: &Path, config: &Package) -> Option<TranslationUnit> {
             .collect();
     }
 
+    let uses_comptime = crate::core::comptime::has_comptime_markers(&raw_content);
     let (direct_headers, headers_hash) =
-        collect_header_dependencies(path, &content, &config.include_dirs);
+        collect_header_dependencies(path, &content, &config.include_dirs, uses_comptime);
 
     Some(TranslationUnit {
         path: path.to_path_buf(),
@@ -377,7 +424,11 @@ pub fn discover_sources(source_dir: &str, config: &Package) -> Vec<TranslationUn
             if name_str.starts_with('.') {
                 return false;
             }
-            if name == out_dir_name.as_str() || name == "target" {
+            if name == out_dir_name.as_str()
+                || name == "target"
+                || name == "build"
+                || name == "build_crupp"
+            {
                 return false;
             }
             if !is_tests_dir
@@ -412,7 +463,7 @@ pub fn auto_discover_include_dirs(root: &Path, out_dir: &str) -> Vec<String> {
     let out_dir_name = Path::new(out_dir).file_name().unwrap_or_default();
 
     for entry in walkdir::WalkDir::new(root)
-        .max_depth(4)
+        .max_depth(5)
         .into_iter()
         .filter_entry(|e| {
             if e.depth() == 0 {
@@ -423,7 +474,8 @@ pub fn auto_discover_include_dirs(root: &Path, out_dir: &str) -> Vec<String> {
             if name_str.starts_with('.') {
                 return false;
             }
-            if name == out_dir_name || name == "target" {
+            if name == out_dir_name || name == "target" || name == "build" || name == "build_crupp"
+            {
                 return false;
             }
             true

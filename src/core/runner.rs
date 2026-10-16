@@ -1,6 +1,7 @@
 use crate::config::{
     BuildProfile, Language, default_c_standard, default_cpp_standard, load_manifest_or_autodetect,
 };
+use crate::core::builder::diagnostics::explain_compiler_error;
 use crate::core::scanner::auto_discover_include_dirs;
 use colored::*;
 use std::collections::HashSet;
@@ -167,11 +168,11 @@ pub async fn run_standalone_file(
 
         let shadow = gen_dir.join(file_path.file_name().unwrap());
         let abs_orig = fs::canonicalize(file_path).unwrap_or_else(|_| file_path.to_path_buf());
-        let shadow_content = format!(
-            "#line 1 \"{}\"\n{}",
-            abs_orig.to_string_lossy(),
-            transformed
-        );
+        let escaped_orig = abs_orig
+            .to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"");
+        let shadow_content = format!("#line 1 \"{}\"\n{}", escaped_orig, transformed);
         fs::write(&shadow, shadow_content).map_err(|e| e.to_string())?;
         shadow
     } else {
@@ -243,17 +244,26 @@ pub async fn run_standalone_file(
     comp_cmd.arg(&file_to_compile).arg("-o").arg(&obj_path);
 
     let mut seen_includes = HashSet::new();
+    let mut anc = file_path.parent();
+    while let Some(parent) = anc {
+        let p_str = parent.to_string_lossy();
+        let clean = p_str.trim().trim_start_matches("./").trim();
+        if clean.is_empty() || clean == "." {
+            break;
+        }
+        if seen_includes.insert(clean.to_string()) {
+            comp_cmd.arg(format!("-I{}", clean));
+        }
+        anc = parent.parent();
+    }
     for inc in &manifest.package.include_dirs {
         let clean = inc.trim().trim_start_matches("-I").trim();
         if !clean.is_empty() && seen_includes.insert(clean.to_string()) {
             comp_cmd.arg(format!("-I{}", clean));
         }
     }
-    if let Some(parent) = file_path.parent() {
-        let p_str = parent.to_string_lossy();
-        if !p_str.is_empty() && seen_includes.insert(p_str.to_string()) {
-            comp_cmd.arg(format!("-I{}", p_str));
-        }
+    if Path::new("include").is_dir() && seen_includes.insert("include".to_string()) {
+        comp_cmd.arg("-Iinclude");
     }
 
     if verbose {
@@ -267,6 +277,7 @@ pub async fn run_standalone_file(
 
     if !comp_out.status.success() {
         let err_msg = String::from_utf8_lossy(&comp_out.stderr);
+        explain_compiler_error(&err_msg, lang);
         return Err(format!(
             "Compilation of standalone file '{}' failed:\n{}",
             file_path.display(),

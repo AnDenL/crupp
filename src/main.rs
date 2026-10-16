@@ -18,6 +18,7 @@ async fn main() {
 
     match &cli.command {
         Commands::Build {
+            file_or_target,
             manifest,
             target,
             release,
@@ -26,6 +27,8 @@ async fn main() {
             profile,
             force,
         } => {
+            let effective_target = target.as_deref().or(file_or_target.as_deref());
+
             let build_profile = if *release {
                 BuildProfile::Release
             } else if *debug {
@@ -54,7 +57,7 @@ async fn main() {
 
             let opts = core::builder::BuildOptions {
                 manifest_path: manifest,
-                target_name: target.as_deref(),
+                target_name: effective_target,
                 profile: build_profile,
                 jobs: cli.jobs,
                 verbose,
@@ -68,6 +71,7 @@ async fn main() {
         }
 
         Commands::Run {
+            file_or_target,
             manifest,
             target,
             release,
@@ -76,6 +80,8 @@ async fn main() {
             profile,
             args,
         } => {
+            let effective_target = target.as_deref().or(file_or_target.as_deref());
+
             let build_profile = if *release {
                 BuildProfile::Release
             } else if *debug {
@@ -88,8 +94,8 @@ async fn main() {
                 BuildProfile::Default
             };
 
-            // Check if target refers to a standalone C or C++ source file
-            let is_standalone_source = target.as_ref().map_or(false, |t| {
+            // Check if effective_target refers to a standalone C or C++ source file
+            let is_standalone_source = effective_target.map_or(false, |t| {
                 let p = Path::new(t);
                 if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
                     matches!(
@@ -99,10 +105,10 @@ async fn main() {
                 } else {
                     false
                 }
-            }) || target.as_ref().map_or(false, |t| Path::new(t).is_file());
+            }) || effective_target.map_or(false, |t| Path::new(t).is_file());
 
             if is_standalone_source {
-                let file_path = Path::new(target.as_ref().unwrap());
+                let file_path = Path::new(effective_target.unwrap());
                 if let Err(e) = core::runner::run_standalone_file(
                     file_path,
                     manifest,
@@ -120,7 +126,7 @@ async fn main() {
 
             let opts = core::builder::BuildOptions {
                 manifest_path: manifest,
-                target_name: target.as_deref(),
+                target_name: effective_target,
                 profile: build_profile,
                 jobs: cli.jobs,
                 verbose,
@@ -135,7 +141,7 @@ async fn main() {
             println!("{}", "▶️  Running target...".bright_cyan().bold());
             if let Err(e) = core::runner::run_target_verbose(
                 manifest,
-                target.as_deref(),
+                effective_target,
                 args,
                 verbose,
             )
@@ -173,9 +179,14 @@ async fn main() {
             }
         }
 
-        Commands::Check { manifest, target } => {
+        Commands::Check {
+            file_or_target,
+            manifest,
+            target,
+        } => {
+            let effective_target = target.as_deref().or(file_or_target.as_deref());
             if let Err(e) =
-                core::builder::check_project(manifest, target.as_deref(), verbose).await
+                core::builder::check_project(manifest, effective_target, verbose).await
             {
                 eprintln!("\n{} {}", "❌ Syntax check failed:".red().bold(), e);
                 std::process::exit(1);

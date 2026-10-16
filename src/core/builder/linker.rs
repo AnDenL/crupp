@@ -70,12 +70,21 @@ pub async fn link_targets(
         println!("{}", note);
     }
 
-    let all_main_nodes: HashSet<NodeIndex> = units
+    let mut all_main_nodes: HashSet<NodeIndex> = units
         .iter()
         .enumerate()
         .filter(|(_, u)| u.has_main)
         .map(|(i, _)| node_indices[i])
         .collect();
+
+    // Also treat all explicitly configured [[bin]] target entry files as main nodes
+    for b in targets_to_link {
+        let clean_b = b.path.trim_start_matches("./").trim_start_matches('/');
+        let b_path = PathBuf::from(clean_b);
+        if let Some((_, &node)) = path_to_node.iter().find(|(p, _)| p.ends_with(&b_path)) {
+            all_main_nodes.insert(node);
+        }
+    }
 
     let nix_link_flags = crate::core::nix::extra_linker_flags(&pkg.lib_dirs, &pkg.libs);
 
@@ -86,6 +95,14 @@ pub async fn link_targets(
             .iter()
             .find(|(p, _)| p.ends_with(&target_path))
             .map(|(_, &node)| node);
+
+        if target_node.is_none() && !Path::new(&bin.path).exists() {
+            return Err(format!(
+                "Binary target '{}' points to '{}', which does not exist on disk.\n  💡 Tip: Check the [[bin]] path in Crub.toml.",
+                bin.name.bright_red().bold(),
+                bin.path.yellow()
+            ));
+        }
 
         let out_path = build_dir.join(&bin.name);
         println!("{:>12} {}", "Linking".magenta().bold(), bin.name);

@@ -17,6 +17,13 @@ fn get_lib_dirs_cache() -> &'static Mutex<Option<Vec<PathBuf>>> {
     SYSTEM_LIB_DIRS_CACHE.get_or_init(|| Mutex::new(None))
 }
 
+#[inline]
+fn push_unique_path(dirs: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, p: PathBuf) {
+    if p.is_dir() && seen.insert(p.clone()) {
+        dirs.push(p);
+    }
+}
+
 /// Detects whether we are running on NixOS or inside a Nix environment (`nix-shell` / `nix develop`).
 pub fn is_nix_env() -> bool {
     std::env::var_os("IN_NIX_SHELL").is_some()
@@ -135,7 +142,8 @@ fn read_nix_wrapper_support_files(compiler_bin: &str, filenames: &[&str]) -> Vec
     }
     if let Ok(canon) = fs::canonicalize(bin_path) {
         if let Some(parent) = canon.parent().and_then(|p| p.parent()) {
-            if parent.join("nix-support").is_dir() && !wrapper_roots.contains(&parent.to_path_buf())
+            if parent.join("nix-support").is_dir()
+                && !wrapper_roots.contains(&parent.to_path_buf())
             {
                 wrapper_roots.push(parent.to_path_buf());
             }
@@ -253,18 +261,13 @@ pub fn query_compiler_system_includes(compiler_bin: &str, lang: Language) -> Vec
 
     let mut result = Vec::new();
     let mut seen = HashSet::new();
-    let mut push_dir = |p: PathBuf| {
-        if p.is_dir() && seen.insert(p.clone()) {
-            result.push(p);
-        }
-    };
 
     // 1. Collect from NIX_CFLAGS_COMPILE_BEFORE & NIX_CFLAGS_COMPILE
     for var in &["NIX_CFLAGS_COMPILE_BEFORE", "NIX_CFLAGS_COMPILE"] {
         if let Ok(val) = std::env::var(var) {
             let toks: Vec<String> = val.split_whitespace().map(|s| s.to_string()).collect();
             for d in extract_include_dirs_from_flags(&toks) {
-                push_dir(d);
+                push_unique_path(&mut result, &mut seen, d);
             }
         }
     }
@@ -278,7 +281,7 @@ pub fn query_compiler_system_includes(compiler_bin: &str, lang: Language) -> Vec
         if let Ok(val) = std::env::var(var) {
             for p in std::env::split_paths(&val) {
                 if !p.as_os_str().is_empty() {
-                    push_dir(p);
+                    push_unique_path(&mut result, &mut seen, p);
                 }
             }
         }
@@ -291,7 +294,7 @@ pub fn query_compiler_system_includes(compiler_bin: &str, lang: Language) -> Vec
     };
     let wrapper_toks = read_nix_wrapper_support_files(compiler_bin, support_files);
     for d in extract_include_dirs_from_flags(&wrapper_toks) {
-        push_dir(d);
+        push_unique_path(&mut result, &mut seen, d);
     }
 
     // 4. Query compiler preprocessor search list directly (`<compiler> -E -Wp,-v -x <lang> /dev/null`)
@@ -313,14 +316,17 @@ pub fn query_compiler_system_includes(compiler_bin: &str, lang: Language) -> Vec
                 continue;
             }
             if trimmed.starts_with("End of search list.") {
+                in_search_list = false;
                 break;
             }
             if in_search_list && line.starts_with(' ') {
-                let clean = trimmed.trim_end_matches("(framework directory)").trim();
+                let clean = trimmed
+                    .trim_end_matches("(framework directory)")
+                    .trim();
                 if !clean.is_empty() {
                     let p = PathBuf::from(clean);
                     let canon = fs::canonicalize(&p).unwrap_or(p);
-                    push_dir(canon);
+                    push_unique_path(&mut result, &mut seen, canon);
                 }
             }
         }
@@ -351,11 +357,9 @@ pub fn discover_tcc_system_includes(c_compiler: &str) -> Vec<PathBuf> {
             || s.contains("/lib/clang/")
             || s.contains("include-fixed");
         if is_compiler_intrinsic {
-            if seen.insert(d.clone()) {
-                intrinsic_dirs.push(d);
-            }
-        } else if seen.insert(d.clone()) {
-            primary_dirs.push(d);
+            push_unique_path(&mut intrinsic_dirs, &mut seen, d);
+        } else {
+            push_unique_path(&mut primary_dirs, &mut seen, d);
         }
     }
 
@@ -367,9 +371,7 @@ pub fn discover_tcc_system_includes(c_compiler: &str) -> Vec<PathBuf> {
         "/usr/include/aarch64-linux-gnu",
     ] {
         let p = PathBuf::from(sys_path);
-        if p.is_dir() && seen.insert(p.clone()) {
-            primary_dirs.push(p);
-        }
+        push_unique_path(&mut primary_dirs, &mut seen, p);
     }
 
     // If on NixOS and none of the primary directories contain <stdio.h>, scan /nix/store for glibc-*-dev/include
@@ -390,9 +392,7 @@ pub fn discover_tcc_system_includes(c_compiler: &str) -> Vec<PathBuf> {
             glibc_candidates.sort();
             glibc_candidates.reverse();
             for inc in glibc_candidates {
-                if seen.insert(inc.clone()) {
-                    primary_dirs.push(inc);
-                }
+                push_unique_path(&mut primary_dirs, &mut seen, inc);
             }
         }
     }
@@ -402,6 +402,7 @@ pub fn discover_tcc_system_includes(c_compiler: &str) -> Vec<PathBuf> {
 }
 
 /// Discovers system and Nix store library directories (`libc.so.6`, `libm.so.6`, `NIX_LDFLAGS`, `LIBRARY_PATH`, etc.).
+/// Written with zero closure captures to prevent any borrow-checker double-borrow conflicts.
 pub fn discover_system_library_dirs(c_compiler: &str) -> Vec<PathBuf> {
     activate_nix_env_if_available();
 
@@ -412,23 +413,14 @@ pub fn discover_system_library_dirs(c_compiler: &str) -> Vec<PathBuf> {
     }
 
     let mut dirs = Vec::new();
-    let has_libc = dirs
-        .iter()
-        .any(|d: &PathBuf| d.join("libc.so.6").exists() || d.join("libc.so").exists());
-
     let mut seen = HashSet::new();
-    let mut push_dir = |p: PathBuf| {
-        if p.is_dir() && seen.insert(p.clone()) {
-            dirs.push(p);
-        }
-    };
 
     // 1. NIX_LDFLAGS_BEFORE and NIX_LDFLAGS
     for var in &["NIX_LDFLAGS_BEFORE", "NIX_LDFLAGS"] {
         if let Ok(val) = std::env::var(var) {
             let toks: Vec<String> = val.split_whitespace().map(|s| s.to_string()).collect();
             for d in extract_lib_dirs_from_flags(&toks) {
-                push_dir(d);
+                push_unique_path(&mut dirs, &mut seen, d);
             }
         }
     }
@@ -438,7 +430,7 @@ pub fn discover_system_library_dirs(c_compiler: &str) -> Vec<PathBuf> {
         if let Ok(val) = std::env::var(var) {
             for p in std::env::split_paths(&val) {
                 if !p.as_os_str().is_empty() {
-                    push_dir(p);
+                    push_unique_path(&mut dirs, &mut seen, p);
                 }
             }
         }
@@ -448,7 +440,7 @@ pub fn discover_system_library_dirs(c_compiler: &str) -> Vec<PathBuf> {
     let wrapper_ldflags =
         read_nix_wrapper_support_files(c_compiler, &["libc-ldflags", "cc-ldflags"]);
     for d in extract_lib_dirs_from_flags(&wrapper_ldflags) {
-        push_dir(d);
+        push_unique_path(&mut dirs, &mut seen, d);
     }
 
     // 4. Query compiler for exact location of libc.so.6 and libm.so
@@ -465,7 +457,7 @@ pub fn discover_system_library_dirs(c_compiler: &str) -> Vec<PathBuf> {
                 if p.is_file() {
                     let canon = fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
                     if let Some(parent) = canon.parent() {
-                        push_dir(parent.to_path_buf());
+                        push_unique_path(&mut dirs, &mut seen, parent.to_path_buf());
                     }
                 }
             }
@@ -474,13 +466,10 @@ pub fn discover_system_library_dirs(c_compiler: &str) -> Vec<PathBuf> {
 
     // 5. Common NixOS profile library paths & standard FHS library paths
     if let Ok(home) = std::env::var("HOME") {
-        push_dir(PathBuf::from(format!("{}/.nix-profile/lib", home)));
+        push_unique_path(&mut dirs, &mut seen, PathBuf::from(format!("{}/.nix-profile/lib", home)));
     }
     if let Ok(user) = std::env::var("USER") {
-        push_dir(PathBuf::from(format!(
-            "/etc/profiles/per-user/{}/lib",
-            user
-        )));
+        push_unique_path(&mut dirs, &mut seen, PathBuf::from(format!("/etc/profiles/per-user/{}/lib", user)));
     }
     for root in &[
         "/run/current-system/sw/lib",
@@ -493,10 +482,13 @@ pub fn discover_system_library_dirs(c_compiler: &str) -> Vec<PathBuf> {
         "/usr/lib/aarch64-linux-gnu",
         "/opt/homebrew/lib",
     ] {
-        push_dir(PathBuf::from(root));
+        push_unique_path(&mut dirs, &mut seen, PathBuf::from(root));
     }
 
     // 6. Last-resort fallback scan of /nix/store for glibc lib directory if on NixOS
+    let has_libc = dirs
+        .iter()
+        .any(|d| d.join("libc.so.6").exists() || d.join("libc.so").exists());
     if !has_libc && Path::new("/nix/store").is_dir() {
         if let Ok(entries) = fs::read_dir("/nix/store") {
             let mut candidates = Vec::new();
@@ -513,7 +505,7 @@ pub fn discover_system_library_dirs(c_compiler: &str) -> Vec<PathBuf> {
             candidates.sort();
             candidates.reverse();
             for c in candidates {
-                push_dir(c);
+                push_unique_path(&mut dirs, &mut seen, c);
             }
         }
     }

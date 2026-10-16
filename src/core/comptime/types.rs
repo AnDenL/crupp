@@ -54,19 +54,28 @@ impl TypeKind {
             return TypeKind::Array;
         }
 
-        let clean = base_no_ptr.trim_start_matches("const ").trim();
+        let clean = base_no_ptr
+            .trim_start_matches("const ")
+            .trim_start_matches("volatile ")
+            .trim();
         match clean {
-            "int8_t" | "signed char" | "i8" => TypeKind::Int8,
-            "uint8_t" | "unsigned char" | "u8" => TypeKind::UInt8,
-            "int16_t" | "short" | "short int" | "i16" => TypeKind::Int16,
-            "uint16_t" | "unsigned short" | "u16" => TypeKind::UInt16,
-            "int" | "int32_t" | "long" | "signed int" | "i32" => TypeKind::Int32,
-            "uint32_t" | "unsigned int" | "unsigned long" | "u32" => TypeKind::UInt32,
-            "int64_t" | "long long" | "i64" | "isize" | "ssize_t" => TypeKind::Int64,
-            "uint64_t" | "unsigned long long" | "size_t" | "u64" | "usize" => TypeKind::UInt64,
+            "int8_t" | "signed char" | "i8" | "s8" => TypeKind::Int8,
+            "uint8_t" | "unsigned char" | "u8" | "byte" => TypeKind::UInt8,
+            "int16_t" | "short" | "short int" | "signed short" | "i16" | "s16" => TypeKind::Int16,
+            "uint16_t" | "unsigned short" | "unsigned short int" | "u16" => TypeKind::UInt16,
+            "int" | "int32_t" | "long" | "signed int" | "signed" | "i32" | "s32" => TypeKind::Int32,
+            "uint32_t" | "unsigned int" | "unsigned" | "unsigned long" | "u32" => TypeKind::UInt32,
+            "int64_t" | "long long" | "signed long long" | "i64" | "s64" | "isize" | "ssize_t"
+            | "ptrdiff_t" => TypeKind::Int64,
+            "uint64_t"
+            | "unsigned long long"
+            | "size_t"
+            | "u64"
+            | "usize"
+            | "uintptr_t" => TypeKind::UInt64,
             "float" | "f32" => TypeKind::Float,
-            "double" | "f64" => TypeKind::Double,
-            "bool" | "_Bool" => TypeKind::Bool,
+            "double" | "f64" | "long double" => TypeKind::Double,
+            "bool" | "_Bool" | "b8" | "b32" => TypeKind::Bool,
             "char" => TypeKind::Char,
             _ => {
                 if clean.starts_with("struct ") {

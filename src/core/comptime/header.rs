@@ -30,7 +30,7 @@ fn format_legacy_attr_summary(attrs: &[CtAttr]) -> String {
 }
 
 pub fn generate_comptime_header(structs: &[CtStruct], enums: &[CtEnum]) -> String {
-    let mut s = String::with_capacity(16384);
+    let mut s = String::with_capacity(20480);
 
     s.push_str(
         r#"#ifndef COMPTIME_H
@@ -44,6 +44,38 @@ pub fn generate_comptime_header(structs: &[CtStruct], enums: &[CtEnum]) -> Strin
 #include <stddef.h>
 #include <stdarg.h>
 #include <ctype.h>
+
+// ============================================================================
+// NULL-Safe String Operations for Bulletproof Comptime Serializers (JSON/RON/TOML)
+// ============================================================================
+
+static inline size_t _ct_safe_strlen(const char* s) {
+    return s ? strlen(s) : 0;
+}
+
+static inline int _ct_safe_strcmp(const char* a, const char* b) {
+    if (a == b) return 0;
+    if (!a) return -1;
+    if (!b) return 1;
+    return strcmp(a, b);
+}
+
+static inline int _ct_safe_strncmp(const char* a, const char* b, size_t n) {
+    if (a == b || n == 0) return 0;
+    if (!a) return -1;
+    if (!b) return 1;
+    return strncmp(a, b, n);
+}
+
+static inline bool ct_streq(const char* a, const char* b) {
+    return _ct_safe_strcmp(a, b) == 0;
+}
+
+#ifdef __TINYC__
+#define strlen(s) _ct_safe_strlen(s)
+#define strcmp(a, b) _ct_safe_strcmp(a, b)
+#define strncmp(a, b, n) _ct_safe_strncmp(a, b, n)
+#endif
 
 typedef enum {
     TYPE_INT8,
@@ -301,7 +333,7 @@ static inline const ct_struct* get_struct(int index) {
 static inline const ct_struct* find_struct(const char* name) {
     if (!name) return NULL;
     for (int i = 0; i < _CT_STRUCT_COUNT; i++) {
-        if (_CT_ALL_STRUCTS[i].name && strcmp(_CT_ALL_STRUCTS[i].name, name) == 0) {
+        if (_CT_ALL_STRUCTS[i].name && _ct_safe_strcmp(_CT_ALL_STRUCTS[i].name, name) == 0) {
             return &_CT_ALL_STRUCTS[i];
         }
     }
@@ -311,7 +343,7 @@ static inline const ct_struct* find_struct(const char* name) {
 static inline const ct_field* find_field(const ct_struct* s, const char* name) {
     if (!s || !s->fields || !name) return NULL;
     for (int i = 0; i < s->field_count; i++) {
-        if (s->fields[i].name && strcmp(s->fields[i].name, name) == 0) {
+        if (s->fields[i].name && _ct_safe_strcmp(s->fields[i].name, name) == 0) {
             return &s->fields[i];
         }
     }
@@ -332,7 +364,7 @@ static inline const ct_enum* get_enum(int index) {
 static inline const ct_enum* find_enum(const char* name) {
     if (!name) return NULL;
     for (int i = 0; i < _CT_ENUM_COUNT; i++) {
-        if (_CT_ALL_ENUMS[i].name && strcmp(_CT_ALL_ENUMS[i].name, name) == 0) {
+        if (_CT_ALL_ENUMS[i].name && _ct_safe_strcmp(_CT_ALL_ENUMS[i].name, name) == 0) {
             return &_CT_ALL_ENUMS[i];
         }
     }
@@ -342,7 +374,7 @@ static inline const ct_enum* find_enum(const char* name) {
 static inline const ct_variant* find_variant(const ct_enum* e, const char* name) {
     if (!e || !e->variants || !name) return NULL;
     for (int i = 0; i < e->variant_count; i++) {
-        if (e->variants[i].name && strcmp(e->variants[i].name, name) == 0) {
+        if (e->variants[i].name && _ct_safe_strcmp(e->variants[i].name, name) == 0) {
             return &e->variants[i];
         }
     }
@@ -350,21 +382,39 @@ static inline const ct_variant* find_variant(const ct_enum* e, const char* name)
 }
 
 // ============================================================================
-// NULL-Safe Attribute Inspection Helpers
+// NULL-Safe Attribute Inspection Helpers (with smart 'def' <-> 'default' alias)
 // ============================================================================
+
+static const char* _ct_last_queried_struct_attr = NULL;
+static int _ct_queried_struct_attr_matches = 0;
+
+static inline bool _ct_attr_name_matches(const char* actual, const char* queried) {
+    if (!actual || !queried) return false;
+    if (_ct_safe_strcmp(actual, queried) == 0) return true;
+    if ((_ct_safe_strcmp(actual, "default") == 0 && _ct_safe_strcmp(queried, "def") == 0) ||
+        (_ct_safe_strcmp(actual, "def") == 0 && _ct_safe_strcmp(queried, "default") == 0)) {
+        return true;
+    }
+    return false;
+}
 
 static inline bool ct_has_attr(int count, const ct_attr* attrs, const char* name) {
     if (!attrs || !name || count <= 0) return false;
     for (int i = 0; i < count; i++) {
-        if (attrs[i].name && strcmp(attrs[i].name, name) == 0) return true;
+        if (_ct_attr_name_matches(attrs[i].name, name)) return true;
     }
     return false;
 }
 
 static inline const char* ct_get_attr(int count, const ct_attr* attrs, const char* name) {
     if (!attrs || !name || count <= 0) return NULL;
+    // 1. Exact match first
     for (int i = 0; i < count; i++) {
-        if (attrs[i].name && strcmp(attrs[i].name, name) == 0) return attrs[i].value;
+        if (attrs[i].name && _ct_safe_strcmp(attrs[i].name, name) == 0) return attrs[i].value;
+    }
+    // 2. Alias match ('def' <-> 'default')
+    for (int i = 0; i < count; i++) {
+        if (_ct_attr_name_matches(attrs[i].name, name)) return attrs[i].value;
     }
     return NULL;
 }
@@ -375,7 +425,14 @@ static inline const char* ct_attr_or(int count, const ct_attr* attrs, const char
 }
 
 static inline bool struct_has_attr(const ct_struct* s, const char* name) {
-    return s ? ct_has_attr(s->attr_count, s->attrs, name) : false;
+    if (name && name[0] != '\0') {
+        _ct_last_queried_struct_attr = name;
+    }
+    bool found = s ? ct_has_attr(s->attr_count, s->attrs, name) : false;
+    if (found) {
+        _ct_queried_struct_attr_matches++;
+    }
+    return found;
 }
 
 static inline const char* struct_get_attr(const ct_struct* s, const char* name) {
@@ -423,7 +480,7 @@ static inline const char* variant_attr_or(const ct_variant* v, const char* name,
 }
 
 // ============================================================================
-// String Utilities (Case Conversion & Formatting for C Codegen)
+// String & Serialization Utilities (for JSON / RON / TOML Codegen)
 // ============================================================================
 
 static inline void str_to_lower(char* dest, size_t dest_size, const char* src) {
@@ -447,9 +504,9 @@ static inline void str_to_upper(char* dest, size_t dest_size, const char* src) {
 }
 
 static inline const char* str_trim_prefix(const char* str, const char* prefix) {
-    if (!str || !prefix) return str;
-    size_t pre_len = strlen(prefix);
-    if (strncmp(str, prefix, pre_len) == 0) {
+    if (!str || !prefix) return str ? str : "";
+    size_t pre_len = _ct_safe_strlen(prefix);
+    if (_ct_safe_strncmp(str, prefix, pre_len) == 0) {
         return str + pre_len;
     }
     return str;
@@ -458,11 +515,12 @@ static inline const char* str_trim_prefix(const char* str, const char* prefix) {
 static inline void str_to_snake_case(char* dest, size_t dest_size, const char* src) {
     if (!dest || dest_size == 0) return;
     size_t si = 0, di = 0;
+    size_t src_len = _ct_safe_strlen(src);
     while (src && src[si] && di + 2 < dest_size) {
         char c = src[si];
         if (isupper((unsigned char)c) && si > 0) {
             char prev = src[si - 1];
-            if (islower((unsigned char)prev) || (si + 1 < strlen(src) && islower((unsigned char)src[si + 1]))) {
+            if (islower((unsigned char)prev) || (si + 1 < src_len && islower((unsigned char)src[si + 1]))) {
                 dest[di++] = '_';
             }
         }
@@ -474,15 +532,70 @@ static inline void str_to_snake_case(char* dest, size_t dest_size, const char* s
 
 static inline bool str_starts_with(const char* str, const char* prefix) {
     if (!str || !prefix) return false;
-    return strncmp(str, prefix, strlen(prefix)) == 0;
+    return _ct_safe_strncmp(str, prefix, _ct_safe_strlen(prefix)) == 0;
 }
 
 static inline bool str_ends_with(const char* str, const char* suffix) {
     if (!str || !suffix) return false;
-    size_t l1 = strlen(str);
-    size_t l2 = strlen(suffix);
+    size_t l1 = _ct_safe_strlen(str);
+    size_t l2 = _ct_safe_strlen(suffix);
     if (l2 > l1) return false;
-    return strcmp(str + l1 - l2, suffix) == 0;
+    return _ct_safe_strcmp(str + l1 - l2, suffix) == 0;
+}
+
+static inline bool type_is_signed_int(TypeKind k) {
+    return k == TYPE_INT8 || k == TYPE_INT16 || k == TYPE_INT32 || k == TYPE_INT64;
+}
+
+static inline bool type_is_unsigned_int(TypeKind k) {
+    return k == TYPE_UINT8 || k == TYPE_UINT16 || k == TYPE_UINT32 || k == TYPE_UINT64;
+}
+
+static inline bool type_is_integer(TypeKind k) {
+    return type_is_signed_int(k) || type_is_unsigned_int(k);
+}
+
+static inline bool type_is_float(TypeKind k) {
+    return k == TYPE_FLOAT || k == TYPE_DOUBLE;
+}
+
+static inline bool type_is_numeric(TypeKind k) {
+    return type_is_integer(k) || type_is_float(k);
+}
+
+static inline bool type_is_string(TypeKind k) {
+    return k == TYPE_STRING;
+}
+
+static inline const char* type_printf_spec(TypeKind k) {
+    switch (k) {
+        case TYPE_INT8:
+        case TYPE_INT16:
+        case TYPE_INT32:  return "%d";
+        case TYPE_INT64:  return "%lld";
+        case TYPE_UINT8:
+        case TYPE_UINT16:
+        case TYPE_UINT32: return "%u";
+        case TYPE_UINT64: return "%llu";
+        case TYPE_FLOAT:
+        case TYPE_DOUBLE: return "%g";
+        case TYPE_BOOL:   return "%s";
+        case TYPE_CHAR:   return "%c";
+        case TYPE_STRING: return "%s";
+        default:          return "%p";
+    }
+}
+
+static inline const ct_struct* field_struct_type(const ct_field* f) {
+    if (!f || !f->type) return NULL;
+    const char* t = str_trim_prefix(f->type, "struct ");
+    return find_struct(t);
+}
+
+static inline const ct_enum* field_enum_type(const ct_field* f) {
+    if (!f || !f->type) return NULL;
+    const char* t = str_trim_prefix(f->type, "enum ");
+    return find_enum(t);
 }
 
 // ============================================================================
@@ -492,6 +605,7 @@ static inline bool str_ends_with(const char* str, const char* suffix) {
 static char* _ct_emit_buf = NULL;
 static size_t _ct_emit_len = 0;
 static size_t _ct_emit_cap = 0;
+static int _ct_emit_used = 0;
 
 static inline void _ct_append_bytes(const char* data, size_t len) {
     if (!data || len == 0) return;
@@ -511,12 +625,14 @@ static inline void _ct_append_bytes(const char* data, size_t len) {
 }
 
 static inline void emit(const char* str) {
+    _ct_emit_used = 1;
     if (str) {
-        _ct_append_bytes(str, strlen(str));
+        _ct_append_bytes(str, _ct_safe_strlen(str));
     }
 }
 
 static inline void emitf(const char* fmt, ...) {
+    _ct_emit_used = 1;
     if (!fmt) return;
     char stack_buf[4096];
     va_list args;
@@ -553,6 +669,21 @@ const char* __crupp_get_emitted_code(void) {
     return _ct_emit_buf ? _ct_emit_buf : "";
 }
 
+int __crupp_was_emit_used(void) {
+    return _ct_emit_used;
+}
+
+const char* __crupp_get_unmatched_struct_attr(void) {
+    if (_ct_last_queried_struct_attr && _ct_queried_struct_attr_matches == 0) {
+        return _ct_last_queried_struct_attr;
+    }
+    return NULL;
+}
+
+int __crupp_get_struct_count(void) {
+    return _CT_STRUCT_COUNT;
+}
+
 void __crupp_free_emitted_code(void) {
     if (_ct_emit_buf) {
         free(_ct_emit_buf);
@@ -560,6 +691,9 @@ void __crupp_free_emitted_code(void) {
         _ct_emit_len = 0;
         _ct_emit_cap = 0;
     }
+    _ct_emit_used = 0;
+    _ct_last_queried_struct_attr = NULL;
+    _ct_queried_struct_attr_matches = 0;
 }
 
 // ============================================================================
@@ -581,6 +715,22 @@ void __crupp_free_emitted_code(void) {
 #define for_each_variant(en, var) \
     for (int _v = 0; (en) && _v < (en)->variant_count; _v++) \
         for (const ct_variant* var = &(en)->variants[_v]; var; var = NULL)
+
+// ============================================================================
+// Clangd / LSP Seamless Integration (Active only in IDE / clangd, never in TCC)
+// ============================================================================
+#ifndef __TINYC__
+#if defined(__CRUPP_LSP_GEN_HEADER__)
+#if defined(__has_include)
+#if __has_include(__CRUPP_LSP_GEN_HEADER__)
+#include __CRUPP_LSP_GEN_HEADER__
+#endif
+#endif
+#endif
+#define _CRUPP_LSP_CAT2(a, b) a##b
+#define _CRUPP_LSP_CAT(a, b) _CRUPP_LSP_CAT2(a, b)
+#define main _CRUPP_LSP_CAT(__crupp_comptime_main_, __COUNTER__)
+#endif
 
 #endif /* COMPTIME_H */
 "#,

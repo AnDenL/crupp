@@ -5,7 +5,7 @@ use crate::core::scanner::TranslationUnit;
 use colored::*;
 use std::collections::HashSet;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::process::Command;
 
@@ -66,12 +66,14 @@ pub async fn compile_unit(
 
     let raw_source = fs::read_to_string(&unit.path).map_err(|e| e.to_string())?;
     let file_to_compile = if crate::core::comptime::has_comptime_markers(&raw_source) {
-        let transformed_code = crate::core::comptime::transform_comptime(
-            &raw_source,
-            &ctx.package.include_dirs,
-            &ctx.obj_dir,
-            &unit.path,
-        )?;
+        let transformed_code = ctx.pb.suspend(|| {
+            crate::core::comptime::transform_comptime(
+                &raw_source,
+                &ctx.package.include_dirs,
+                &ctx.obj_dir,
+                &unit.path,
+            )
+        })?;
 
         if transformed_code != raw_source {
             let gen_dir = ctx.obj_dir.join("gen");
@@ -142,6 +144,21 @@ pub async fn compile_unit(
 
     let mut seen_includes = HashSet::new();
 
+    // 1. Add unit's own parent and ancestor directories first so relative #include "..." in shadow files always resolve
+    let mut anc = unit.path.parent();
+    while let Some(parent) = anc {
+        let p_str = parent.to_string_lossy();
+        let clean = p_str.trim().trim_start_matches("./").trim();
+        if clean.is_empty() || clean == "." {
+            break;
+        }
+        if seen_includes.insert(clean.to_string()) {
+            cmd.arg(format!("-I{}", clean));
+        }
+        anc = parent.parent();
+    }
+
+    // 2. Add configured include_dirs
     for inc in &ctx.package.include_dirs {
         let clean = inc.trim().trim_start_matches("-I").trim();
         if clean.is_empty() {
@@ -152,14 +169,9 @@ pub async fn compile_unit(
         }
     }
 
-    if let Some(parent) = unit.path.parent() {
-        let p_str = parent.to_string_lossy();
-        let clean = p_str.trim().trim_start_matches("./").trim();
-        if !clean.is_empty() && clean != "." {
-            if seen_includes.insert(clean.to_string()) {
-                cmd.arg(format!("-I{}", clean));
-            }
-        }
+    // 3. Ensure standard "include" directory is included if present on disk
+    if Path::new("include").is_dir() && seen_includes.insert("include".to_string()) {
+        cmd.arg("-Iinclude");
     }
 
     if unit.language == Language::Cpp {
@@ -198,7 +210,7 @@ pub async fn compile_unit(
                 unit.path.display()
             );
             eprintln!("{}", stderr);
-            explain_compiler_error(&stderr);
+            explain_compiler_error(&stderr, unit.language);
         });
         Err(format!(
             "Compilation stopped due to errors in {}",

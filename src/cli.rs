@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "crupp",
-    version = "0.4.1",
+    version = "0.4.2",
     about = "🚀 A lightning-fast, zero-config Cargo-like build system for C and C++ (with C++20 modules, comptime, and NixOS integration)"
 )]
 pub struct Cli {
@@ -27,6 +27,10 @@ pub struct Cli {
 pub enum Commands {
     /// Build targets in the project (compile + link)
     Build {
+        /// Optional target name (binary target to build)
+        #[arg(value_name = "TARGET")]
+        file_or_target: Option<String>,
+
         /// Path to configuration manifest (Crub.toml or crupp.toml)
         #[arg(short, long, default_value = "Crub.toml")]
         manifest: String,
@@ -58,6 +62,10 @@ pub enum Commands {
 
     /// Build and run a target or standalone source file (.c / .cpp)
     Run {
+        /// Optional target name or path to standalone source file (e.g., scratchpad.c)
+        #[arg(value_name = "TARGET_OR_FILE")]
+        file_or_target: Option<String>,
+
         /// Path to configuration manifest
         #[arg(short, long, default_value = "Crub.toml")]
         manifest: String,
@@ -82,13 +90,17 @@ pub enum Commands {
         #[arg(long = "profile")]
         profile: Option<String>,
 
-        /// Arguments passed to the target executable
+        /// Arguments passed to the target executable (after `--`)
         #[arg(last = true)]
         args: Vec<String>,
     },
 
     /// Fast syntax-only check without linking (-fsyntax-only)
     Check {
+        /// Optional target to check
+        #[arg(value_name = "TARGET")]
+        file_or_target: Option<String>,
+
         /// Path to configuration manifest
         #[arg(short, long, default_value = "Crub.toml")]
         manifest: String,
