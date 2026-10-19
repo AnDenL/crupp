@@ -49,8 +49,7 @@ fn ensure_runtime_libraries() {
             let libm_cand = dir.join("libm.so.6");
             if libm_cand.exists() {
                 if let Ok(c_path) = CString::new(libm_cand.to_string_lossy().as_bytes()) {
-                    let handle =
-                        libc::dlopen(c_path.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL);
+                    let handle = libc::dlopen(c_path.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL);
                     if !handle.is_null() {
                         LIBM_PRELOADED.store(true, Ordering::SeqCst);
                     }
@@ -315,11 +314,11 @@ fn format_comptime_diagnostic(raw_err: &str, code: &str, origin_file: &Path) -> 
 
     if let Some(cpp_feature) = detect_cpp_in_comptime(code, raw_err) {
         hints.push(format!(
-            "  {} Виявлено C++ конструкцію ({}) всередині '#if comptime'!\n      {}\n      {}",
-            "💡 Причина помилки (C++ у блоці #if comptime):".yellow().bold(),
+            "  {} C++ construct ({}) detected inside '#if comptime' block!\n      {}\n      {}",
+            "💡 Root cause (C++ inside #if comptime block):".yellow().bold(),
             cpp_feature.bright_red().bold(),
-            "• Блок '#if comptime' виконується вбудованим JIT-компілятором TinyCC (чистий C99/C11), який НЕ підтримує синтаксис C++.".cyan(),
-            "• Рішення: пишіть сам генератор на чистому C (<stdio.h>, <string.h>, <comptime.h>, emit(), emitf()). Всередину emitf(\"...\") ви можете передавати будь-який C або C++ код!".bright_green()
+            "• The '#if comptime' block is executed by the embedded TinyCC JIT compiler (pure C99/C11), which does NOT support C++ syntax.".cyan(),
+            "• Fix: write the generator itself in pure C (<stdio.h>, <string.h>, <comptime.h>, emit(), emitf()). You can still emit any C or C++ code by passing it as a string to emitf(\"...\")!".bright_green()
         ));
     }
 
@@ -334,10 +333,10 @@ fn format_comptime_diagnostic(raw_err: &str, code: &str, origin_file: &Path) -> 
         {
             hints.push(format!(
                 "  {} {}\n      {}\n      {}",
-                "💡 Що це за помилка:".yellow().bold(),
-                "Бібліотека 'm' — це стандартна математична бібліотека C (libm.so, де містяться sin, cos, sqrt, pow).".bold(),
-                "• На NixOS: увійдіть у 'nix-shell' або 'nix develop' (де підключено glibc/glibc.dev), або запустіть 'crupp nix'.".cyan(),
-                "• На Ubuntu/Debian: встановіть 'build-essential'.".dimmed()
+                "💡 What this error means:".yellow().bold(),
+                "Library 'm' is the standard C math library (libm.so, containing sin, cos, sqrt, pow).".bold(),
+                "• On NixOS: enter 'nix-shell' or 'nix develop' (with glibc/glibc.dev), or run 'crupp nix'.".cyan(),
+                "• On Ubuntu/Debian: install 'build-essential'.".dimmed()
             ));
         } else if line.contains("library '") && line.contains("not found") {
             if let Some(start) = line.find("library '") {
@@ -347,8 +346,8 @@ fn format_comptime_diagnostic(raw_err: &str, code: &str, origin_file: &Path) -> 
                     let nix_hint =
                         crate::core::nix::map_lib_to_nix_pkg(lib_name).unwrap_or(lib_name);
                     hints.push(format!(
-                        "  {} Відсутня бібліотека '{}' для comptime виконання.\n      Додайте її в shell.nix або запустіть: nix-shell -p {}",
-                        "💡 Підказка:".yellow().bold(),
+                        "  {} Missing library '{}' required for comptime execution.\n      Add it to shell.nix or run: nix-shell -p {}",
+                        "💡 Hint:".yellow().bold(),
                         lib_name.green().bold(),
                         nix_hint.cyan().bold()
                     ));
@@ -360,8 +359,8 @@ fn format_comptime_diagnostic(raw_err: &str, code: &str, origin_file: &Path) -> 
                 if let Some(end) = rest.find('\'') {
                     let hdr_name = &rest[..end];
                     hints.push(format!(
-                        "  {} Заголовочний файл '{}' не знайдено під час виконання '#if comptime' у {}.\n      • Якщо це локальний заголовок проєкту — перевірте 'include_dirs' у Crub.toml.\n      • Якщо цей заголовок потрібен лише для фінального коду (а не для генератора) — перемістіть '#include \"{}\"' за межі '#if comptime' або емітуйте його через emit(\"#include ...\").",
-                        "💡 Підказка:".yellow().bold(),
+                        "  {} Header '{}' not found while executing '#if comptime' in {}.\n      • If this is a local project header — check 'include_dirs' in Crub.toml.\n      • If this header is needed only for the final code (not the generator) — move '#include \"{}\"' outside the '#if comptime' block, or emit it via emit(\"#include ...\").",
+                        "💡 Hint:".yellow().bold(),
                         hdr_name.green().bold(),
                         origin_file.display(),
                         hdr_name
@@ -374,8 +373,8 @@ fn format_comptime_diagnostic(raw_err: &str, code: &str, origin_file: &Path) -> 
                 if let Some(end) = rest.find('\'') {
                     let sym_name = &rest[..end];
                     hints.push(format!(
-                        "  {} Невідомий символ '{}' під час виконання '#if comptime' у {}.\n      • Блок '#if comptime' виконується ПІД ЧАС компіляції (до того, як ваш проєкт скомпільовано).\n      • Якщо '{}' — це функція вашого рушія/проєкту і ви хотіли згенерувати її виклик у фінальний C-код, обгорніть її у emitf(\"{}(...);\\n\");",
-                        "💡 Підказка:".yellow().bold(),
+                        "  {} Unknown symbol '{}' while executing '#if comptime' in {}.\n      • The '#if comptime' block runs DURING compilation (before your project is compiled).\n      • If '{}' is a function from your engine/project and you wanted to generate a call to it in the final C code, wrap it in emitf(\"{}(...);\\n\");",
+                        "💡 Hint:".yellow().bold(),
                         sym_name.green().bold(),
                         origin_file.display(),
                         sym_name,
@@ -734,7 +733,7 @@ pub fn execute_c_code(
 
         if let Some(attr) = unmatched_attr {
             eprintln!(
-                "   {} У блоці comptime ({}) перевірявся атрибут '@{}', але жодна структура з '// @{}' не була знайдена (всього проскановано структур: {}).",
+                "   {} Comptime block ({}) queried attribute '@{}', but no struct annotated with '// @{}' was found (total structs scanned: {}).",
                 "⚠️  [comptime]".yellow().bold(),
                 origin_file.display(),
                 attr,
@@ -751,7 +750,10 @@ pub fn execute_c_code(
                 if total_output.trim().is_empty() {
                     String::new()
                 } else {
-                    format!("\n  Emitted output before exit:\n    {}", total_output.trim())
+                    format!(
+                        "\n  Emitted output before exit:\n    {}",
+                        total_output.trim()
+                    )
                 }
             ));
         }

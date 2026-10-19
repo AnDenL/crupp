@@ -105,7 +105,8 @@ async fn main() {
                 } else {
                     false
                 }
-            }) || effective_target.map_or(false, |t| Path::new(t).is_file());
+            }) || effective_target
+                .map_or(false, |t| Path::new(t).is_file());
 
             if is_standalone_source {
                 let file_path = Path::new(effective_target.unwrap());
@@ -139,38 +140,37 @@ async fn main() {
             }
 
             println!("{}", "▶️  Running target...".bright_cyan().bold());
-            if let Err(e) = core::runner::run_target_verbose(
-                manifest,
-                effective_target,
-                args,
-                verbose,
-            )
-            .await
+            if let Err(e) =
+                core::runner::run_target_verbose(manifest, effective_target, args, verbose).await
             {
                 eprintln!("\n{} {}", "❌ Target error:".red().bold(), e);
                 std::process::exit(1);
             }
         }
 
-        Commands::AddBin { name, path, manifest } => {
-            match config::add_bin_to_manifest(manifest, name, path) {
-                Ok(msg) => println!("{:>12} {}", "Success".green().bold(), msg),
-                Err(e) => {
-                    eprintln!("{} {}", "❌ Error:".red().bold(), e);
-                    std::process::exit(1);
-                }
+        Commands::AddBin {
+            name,
+            path,
+            manifest,
+        } => match config::add_bin_to_manifest(manifest, name, path) {
+            Ok(msg) => println!("{:>12} {}", "Success".green().bold(), msg),
+            Err(e) => {
+                eprintln!("{} {}", "❌ Error:".red().bold(), e);
+                std::process::exit(1);
             }
-        }
+        },
 
-        Commands::AddLib { lib, manifest, no_check } => {
-            match config::add_library_to_manifest(manifest, lib, *no_check) {
-                Ok(msg) => println!("{:>12} {}", "Success".green().bold(), msg),
-                Err(e) => {
-                    eprintln!("{} {}", "❌ Error:".red().bold(), e);
-                    std::process::exit(1);
-                }
+        Commands::AddLib {
+            lib,
+            manifest,
+            no_check,
+        } => match config::add_library_to_manifest(manifest, lib, *no_check) {
+            Ok(msg) => println!("{:>12} {}", "Success".green().bold(), msg),
+            Err(e) => {
+                eprintln!("{} {}", "❌ Error:".red().bold(), e);
+                std::process::exit(1);
             }
-        }
+        },
 
         Commands::CheckLibs { manifest } => {
             if let Err(e) = config::check_manifest_libraries(manifest) {
@@ -185,8 +185,7 @@ async fn main() {
             target,
         } => {
             let effective_target = target.as_deref().or(file_or_target.as_deref());
-            if let Err(e) =
-                core::builder::check_project(manifest, effective_target, verbose).await
+            if let Err(e) = core::builder::check_project(manifest, effective_target, verbose).await
             {
                 eprintln!("\n{} {}", "❌ Syntax check failed:".red().bold(), e);
                 std::process::exit(1);
@@ -226,7 +225,9 @@ async fn main() {
         } => {
             println!(
                 "{}",
-                "❄️  Generating NixOS development environment...".bright_cyan().bold()
+                "❄️  Generating NixOS development environment..."
+                    .bright_cyan()
+                    .bold()
             );
             let (loaded_manifest, _) = match config::load_manifest_or_autodetect(manifest) {
                 Ok(res) => res,
@@ -238,7 +239,11 @@ async fn main() {
 
             let shell_content = core::nix::generate_shell_nix(&loaded_manifest);
             if let Err(e) = fs::write("shell.nix", shell_content) {
-                eprintln!("{} Failed to write shell.nix: {}", "❌ Error:".red().bold(), e);
+                eprintln!(
+                    "{} Failed to write shell.nix: {}",
+                    "❌ Error:".red().bold(),
+                    e
+                );
                 std::process::exit(1);
             }
             println!("{:>12} 'shell.nix'", "Created".green().bold());
@@ -246,7 +251,11 @@ async fn main() {
             if *flake {
                 let flake_content = core::nix::generate_flake_nix(&loaded_manifest);
                 if let Err(e) = fs::write("flake.nix", flake_content) {
-                    eprintln!("{} Failed to write flake.nix: {}", "❌ Error:".red().bold(), e);
+                    eprintln!(
+                        "{} Failed to write flake.nix: {}",
+                        "❌ Error:".red().bold(),
+                        e
+                    );
                     std::process::exit(1);
                 }
                 println!("{:>12} 'flake.nix'", "Created".green().bold());
@@ -385,8 +394,19 @@ async fn main() {
             let gitignore = "build/\ncompile_commands.json\n*.o\n*.pcm\n.direnv/\nresult\n";
             let _ = fs::write(&gitignore_path, gitignore);
 
-            println!("{:>12} project '{}'!", "Created".bright_green().bold(), name);
+            println!(
+                "{:>12} project '{}'!",
+                "Created".bright_green().bold(),
+                name
+            );
             println!("\nTo get started:\n  cd {}\n  crupp run\n", name);
+        }
+        Commands::Completions { shell } => {
+            use clap::CommandFactory;
+            use clap_complete::generate;
+            let mut cmd = Cli::command();
+            let bin_name = cmd.get_name().to_string();
+            generate(*shell, &mut cmd, bin_name, &mut std::io::stdout());
         }
     }
 }
@@ -446,7 +466,8 @@ async fn run_tests(manifest_path: &str, filter: Option<&str>, verbose: bool) -> 
             continue;
         }
 
-        match core::runner::run_target_verbose(manifest_path, Some(&test_name), &[], verbose).await {
+        match core::runner::run_target_verbose(manifest_path, Some(&test_name), &[], verbose).await
+        {
             Ok(()) => {
                 println!("{}", "PASSED".green().bold());
                 passed += 1;

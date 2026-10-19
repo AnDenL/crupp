@@ -26,10 +26,7 @@ fn extract_diagnostic_messages_only(stderr: &str) -> String {
         let trimmed = line.trim_start();
         // Skip GCC/Clang source snippet lines like `23 | ...` or `| ^~~~`
         let is_snippet_line = trimmed.starts_with('|')
-            || (trimmed
-                .chars()
-                .next()
-                .map_or(false, |c| c.is_ascii_digit())
+            || (trimmed.chars().next().map_or(false, |c| c.is_ascii_digit())
                 && trimmed.contains(" | "));
         if !is_snippet_line {
             out.push_str(line);
@@ -69,23 +66,24 @@ pub fn explain_compiler_error(stderr: &str, lang: Language) {
             || diag_only.contains("unknown type name ‘template’")
             || diag_only.contains("unknown type name 'constexpr'")
             || diag_only.contains("unknown type name ‘constexpr’")
-            || diag_only.contains("expected ‘=’, ‘,’, ‘;’, ‘asm’ or ‘__attribute__’ before ‘:’ token");
+            || diag_only
+                .contains("expected ‘=’, ‘,’, ‘;’, ‘asm’ or ‘__attribute__’ before ‘:’ token");
 
         if has_cpp_in_c && stderr.contains("::") {
             println!(
-                "    {} Схоже, у файлі чистого C (.c) використано синтаксис C++ (наприклад '::', 'class', 'namespace' або заголовки C++). Перейменуйте файл у .cpp або замініть на чистий C.",
+                "    {} Pure C file (.c) appears to use C++ syntax (e.g. '::', 'class', 'namespace', or C++ headers). Rename the file to .cpp or replace with pure C.",
                 "💡 Tip:".yellow().bold()
             );
         } else if diag_only.contains("implicit declaration of function") {
             println!(
-                "    {} Неявне оголошення функції в C (implicit declaration). Перевірте, що відповідний .h файл підключено через #include або що блок '#if comptime' згенерував цю функцію через emit()/emitf().",
+                "    {} Implicit function declaration in C. Check that the corresponding .h file is included via #include, or that the '#if comptime' block generated this function via emit()/emitf().",
                 "💡 Tip:".yellow().bold()
             );
         } else if diag_only.contains("unknown type name 'bool'")
             || diag_only.contains("unknown type name ‘bool’")
         {
             println!(
-                "    {} Тип 'bool' у C17 потребує '#include <stdbool.h>' (або встановіть standard = \"-std=c23\" у Crub.toml).",
+                "    {} Type 'bool' in C17 requires '#include <stdbool.h>' (or set standard = \"-std=c23\" in Crub.toml).",
                 "💡 Tip:".yellow().bold()
             );
         }
@@ -305,7 +303,8 @@ static KNOWN_LIBS: &[KnownLib] = &[
 ];
 
 pub fn extract_undefined_symbols(stderr: &str) -> Vec<String> {
-    let re = RE_UNDEF.get_or_init(|| Regex::new(r"undefined reference to [`']([^'`]+)['`]").unwrap());
+    let re =
+        RE_UNDEF.get_or_init(|| Regex::new(r"undefined reference to [`']([^'`]+)['`]").unwrap());
 
     let mut seen = HashSet::new();
     let mut symbols = Vec::new();

@@ -233,4 +233,11 @@ pub enum Commands {
         #[arg(long = "nix")]
         nix: bool,
     },
+
+    /// Generate shell completion script (bash, zsh, fish, powershell, elvish)
+    Completions {
+        /// Target shell
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
 }
