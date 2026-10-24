@@ -15,6 +15,7 @@ static RE_INCLUDE: OnceLock<Regex> = OnceLock::new();
 
 // In-memory cache for header file hashes to avoid re-reading the same header across multiple units
 static HEADER_CACHE: OnceLock<Mutex<HashMap<PathBuf, (SystemTime, String)>>> = OnceLock::new();
+static RE_EMBED: OnceLock<Regex> = OnceLock::new();
 
 fn get_header_cache() -> &'static Mutex<HashMap<PathBuf, (SystemTime, String)>> {
     HEADER_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -119,6 +120,57 @@ pub fn strip_comments_fast(text: &str) -> String {
     unsafe { String::from_utf8_unchecked(out) }
 }
 
+pub fn mask_string_literals(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let len = bytes.len();
+    let mut out = Vec::with_capacity(len);
+    let mut i = 0;
+    let mut in_string = false;
+    let mut in_char = false;
+
+    while i < len {
+        let b = bytes[i];
+        if in_string {
+            if b == b'\\' && i + 1 < len {
+                out.push(b' ');
+                out.push(b' ');
+                i += 2;
+                continue;
+            } else if b == b'"' {
+                in_string = false;
+                out.push(b'"');
+            } else {
+                out.push(if b == b'\n' { b'\n' } else { b' ' });
+            }
+        } else if in_char {
+            if b == b'\\' && i + 1 < len {
+                out.push(b' ');
+                out.push(b' ');
+                i += 2;
+                continue;
+            } else if b == b'\'' {
+                in_char = false;
+                out.push(b'\'');
+            } else {
+                out.push(if b == b'\n' { b'\n' } else { b' ' });
+            }
+        } else {
+            if b == b'"' {
+                in_string = true;
+                out.push(b'"');
+            } else if b == b'\'' {
+                in_char = true;
+                out.push(b'\'');
+            } else {
+                out.push(b);
+            }
+        }
+        i += 1;
+    }
+
+    unsafe { String::from_utf8_unchecked(out) }
+}
+
 /// Masks `#if comptime ... #endif` blocks so that metaprogramming code (including any `main()` or `proc()`
 /// written for compile-time execution) is never mistaken for a runtime binary `main()` entrypoint.
 pub fn mask_comptime_blocks(source: &str) -> String {
@@ -133,26 +185,39 @@ fn collect_header_dependencies(
     include_dirs: &[String],
     uses_comptime: bool,
 ) -> (Vec<PathBuf>, String) {
-    let re_inc =
-        RE_INCLUDE.get_or_init(|| Regex::new(r#"^\s*#\s*include\s*["<]([^">]+)[">]"#).unwrap());
-
     let mut direct_headers = Vec::new();
     let mut direct_set = HashSet::new();
     let mut all_visited = HashSet::new();
     let mut header_hasher = Sha256::new();
 
-    // Fast-path scan: only check lines starting with '#' and containing "include"
+    let re_inc =
+        RE_INCLUDE.get_or_init(|| Regex::new(r#"^\s*#\s*include\s*["<]([^">]+)[">]"#).unwrap());
+    let re_emb =
+        RE_EMBED.get_or_init(|| Regex::new(r#"^\s*#\s*embed\s*["<]([^">]+)[">]"#).unwrap());
+
+    // Fast-path scan: only check lines starting with '#' and containing "include" or "embed"
     for line in content.lines() {
         let trimmed = line.trim_start();
-        if !trimmed.starts_with('#') || !trimmed.contains("include") {
+        if !trimmed.starts_with('#') {
             continue;
         }
 
-        if let Some(caps) = re_inc.captures(trimmed) {
-            let inc_name = caps.get(1).unwrap().as_str();
-            if let Some(resolved) = resolve_include_path(inc_name, source_path, include_dirs) {
-                if direct_set.insert(resolved.clone()) {
-                    direct_headers.push(resolved);
+        if trimmed.contains("include") {
+            if let Some(caps) = re_inc.captures(trimmed) {
+                let inc_name = caps.get(1).unwrap().as_str();
+                if let Some(resolved) = resolve_include_path(inc_name, source_path, include_dirs) {
+                    if direct_set.insert(resolved.clone()) {
+                        direct_headers.push(resolved);
+                    }
+                }
+            }
+        } else if trimmed.contains("embed") {
+            if let Some(caps) = re_emb.captures(trimmed) {
+                let emb_name = caps.get(1).unwrap().as_str();
+                if let Some(resolved) = resolve_include_path(emb_name, source_path, include_dirs) {
+                    if direct_set.insert(resolved.clone()) {
+                        direct_headers.push(resolved);
+                    }
                 }
             }
         }
@@ -197,16 +262,30 @@ fn collect_header_dependencies(
                     let clean = strip_comments_fast(&hdr_content);
                     for line in clean.lines() {
                         let trimmed = line.trim_start();
-                        if !trimmed.starts_with('#') || !trimmed.contains("include") {
+                        if !trimmed.starts_with('#') {
                             continue;
                         }
 
-                        if let Some(caps) = re_inc.captures(trimmed) {
-                            let nested_inc = caps.get(1).unwrap().as_str();
-                            if let Some(res) = resolve_include_path(nested_inc, &hdr, include_dirs)
-                            {
-                                if !all_visited.contains(&res) {
-                                    queue.push(res);
+                        if trimmed.contains("include") {
+                            if let Some(caps) = re_inc.captures(trimmed) {
+                                let nested_inc = caps.get(1).unwrap().as_str();
+                                if let Some(res) =
+                                    resolve_include_path(nested_inc, &hdr, include_dirs)
+                                {
+                                    if !all_visited.contains(&res) {
+                                        queue.push(res);
+                                    }
+                                }
+                            }
+                        } else if trimmed.contains("embed") {
+                            if let Some(caps) = re_emb.captures(trimmed) {
+                                let nested_emb = caps.get(1).unwrap().as_str();
+                                if let Some(res) =
+                                    resolve_include_path(nested_emb, &hdr, include_dirs)
+                                {
+                                    if !all_visited.contains(&res) {
+                                        queue.push(res);
+                                    }
                                 }
                             }
                         }
@@ -279,9 +358,9 @@ fn get_or_compute_header_hash(path: &Path) -> Option<String> {
         }
     }
 
-    let content = fs::read_to_string(path).ok()?;
+    let content = fs::read(path).ok()?;
     let mut hasher = Sha256::new();
-    hasher.update(content.as_bytes());
+    hasher.update(content);
     let hash = hex::encode(hasher.finalize());
 
     if let Ok(mut cache) = get_header_cache().lock() {
@@ -298,7 +377,7 @@ fn compute_base_hash(
     headers_hash: &str,
 ) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"crupp-cache-v6");
+    hasher.update(b"crupp-cache-v7");
     hasher.update(content.as_bytes());
     hasher.update(headers_hash.as_bytes());
 
@@ -339,8 +418,7 @@ pub fn scan_file(path: &Path, config: &Package) -> Option<TranslationUnit> {
 
     let raw_content = fs::read_to_string(path).ok()?;
 
-    // Mask `#if comptime ... #endif` BEFORE stripping comments so `#if comptime` inside `/* ... */`
-    // is never misread and `main()` inside `#if comptime` is never mistaken for a binary entrypoint!
+    // Mask `#if comptime ... #endif` BEFORE stripping comments...
     let masked_raw = if crate::core::comptime::has_comptime_markers(&raw_content) {
         mask_comptime_blocks(&raw_content)
     } else {
