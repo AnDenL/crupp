@@ -418,18 +418,20 @@ pub fn scan_file(path: &Path, config: &Package) -> Option<TranslationUnit> {
 
     let raw_content = fs::read_to_string(path).ok()?;
 
-    // Mask `#if comptime ... #endif` BEFORE stripping comments...
     let masked_raw = if crate::core::comptime::has_comptime_markers(&raw_content) {
         mask_comptime_blocks(&raw_content)
     } else {
         raw_content.clone()
     };
+
     let content = strip_comments_fast(&masked_raw);
 
-    let has_main = if content.contains("main") {
+    let code_only = mask_string_literals(&content);
+
+    let has_main = if code_only.contains("main") {
         let re_main =
             RE_MAIN.get_or_init(|| Regex::new(r"(?m)\b(?:int|void|auto)\s+main\s*\(").unwrap());
-        re_main.is_match(&content)
+        re_main.is_match(&code_only)
     } else {
         false
     };
